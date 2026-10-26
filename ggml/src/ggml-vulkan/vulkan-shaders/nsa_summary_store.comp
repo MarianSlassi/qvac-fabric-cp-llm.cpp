@@ -1,0 +1,44 @@
+#version 450
+
+layout(local_size_x = 1) in;
+
+layout(push_constant) uniform P {
+    uint n_dim;
+    uint n_head;
+    uint n_kv;
+    uint n_block;
+    uint block_size;
+    uint nb_k1, nb_k2, nb_k3;
+    uint nb_d1, nb_d2, nb_d3;
+} p;
+
+layout(binding = 0) buffer K { float data[]; } k;
+layout(binding = 1) buffer D { float data[]; } d;
+layout(binding = 2) buffer R { int  data[]; } r;
+
+void main() {
+    const uint ir = gl_GlobalInvocationID.x;
+    const uint ib = ir % p.n_block;
+    const uint ih = (ir / p.n_block) % p.n_head;
+    const uint is = ir / (p.n_block * p.n_head);
+    const int  ib0 = r.data[0];
+    const int  ib1 = r.data[1];
+
+    if (int(ib) < ib0 || int(ib) >= ib1 || (ib + 1)*p.block_size > p.n_kv) {
+        return;
+    }
+
+    const uint out_base = ih*(p.nb_d1/4) + ib*(p.nb_d2/4) + is*(p.nb_d3/4);
+    for (uint dd = 0; dd < p.n_dim; ++dd) {
+        d.data[out_base + dd] = 0.0;
+    }
+    for (uint j = 0; j < p.block_size; ++j) {
+        const uint base = ih*(p.nb_k1/4) + (ib*p.block_size + j)*(p.nb_k2/4) + is*(p.nb_k3/4);
+        for (uint dd = 0; dd < p.n_dim; ++dd) {
+            d.data[out_base + dd] += k.data[base + dd];
+        }
+    }
+    for (uint dd = 0; dd < p.n_dim; ++dd) {
+        d.data[out_base + dd] /= float(p.block_size);
+    }
+}

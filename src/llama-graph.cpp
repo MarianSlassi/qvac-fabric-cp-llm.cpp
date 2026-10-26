@@ -1059,6 +1059,16 @@ void llm_graph_input_attn_cross::set_input(const llama_ubatch * ubatch) {
     }
 }
 
+void llm_graph_input_nsa::set_input(const llama_ubatch * ubatch) {
+    const int32_t n_past = ubatch->pos[0];
+    const int32_t n_tok  = ubatch->n_seq_tokens;
+    int32_t data[2] = {
+        n_past / (int32_t) block_size,
+        (n_past + n_tok) / (int32_t) block_size,
+    };
+    ggml_backend_tensor_set(range, data, 0, sizeof(data));
+}
+
 void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
     mctx->get_attn()->set_input_k_idxs(inp_attn->self_k_idxs, ubatch);
     mctx->get_attn()->set_input_v_idxs(inp_attn->self_v_idxs, ubatch);

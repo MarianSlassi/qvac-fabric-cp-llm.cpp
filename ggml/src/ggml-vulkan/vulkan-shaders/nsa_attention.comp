@@ -1,0 +1,124 @@
+#version 450
+
+layout(local_size_x = 1) in;
+
+layout(push_constant) uniform P {
+    uint n_dim;
+    uint n_q_head;
+    uint n_kv_head;
+    uint n_kv;
+    uint n_token;
+    uint n_block;
+    uint n_select;
+    uint block_size;
+    uint local_size;
+    uint mask_ne3;
+    uint nb_q1, nb_q2, nb_q3;
+    uint nb_k1, nb_k2, nb_k3;
+    uint nb_v1, nb_v2, nb_v3;
+    uint nb_ks1, nb_ks2, nb_ks3;
+    uint nb_vs1, nb_vs2, nb_vs3;
+    uint nb_m0, nb_m1, nb_m3;
+    uint nb_i1, nb_i2, nb_i3;
+    uint nb_o1, nb_o2, nb_o3;
+} p;
+
+layout(binding = 0) buffer Q  { float data[]; } q;
+layout(binding = 1) buffer K  { float data[]; } k;
+layout(binding = 2) buffer V  { float data[]; } v;
+layout(binding = 3) buffer KS { float data[]; } ks;
+layout(binding = 4) buffer VS { float data[]; } vs;
+layout(binding = 5) buffer I  { int   data[]; } idx;
+layout(binding = 6) buffer M  { float data[]; } mask;
+layout(binding = 7) buffer O  { float data[]; } dst;
+
+bool visible(uint ik, uint row) {
+    return mask.data[row + ik*(p.nb_m0/4)] > -1.0e30;
+}
+
+void attend(inout float o[128], inout float sm, inout float ss,
+            uint qbase, uint kbase, uint vbase, bool cmp, float scale) {
+    float dot = 0.0;
+    for (uint dd = 0; dd < p.n_dim; ++dd) {
+        const float kv = cmp ? ks.data[kbase + dd] : k.data[kbase + dd];
+        dot += q.data[qbase + dd] * kv;
+    }
+    const float sc = dot*scale;
+    const float nm = max(sm, sc);
+    const float pr = exp(sm - nm);
+    const float w  = exp(sc - nm);
+    for (uint dd = 0; dd < p.n_dim; ++dd) {
+        const float vv = cmp ? vs.data[vbase + dd] : v.data[vbase + dd];
+        o[dd] = o[dd]*pr + w*vv;
+    }
+    ss = ss*pr + w;
+    sm = nm;
+}
+
+void write_branch(uint br, float o[128], float ss, uint ihq, uint it, uint is) {
+    const uint base = ihq*(p.nb_o1/4) + (br*p.n_token + it)*(p.nb_o2/4) + is*(p.nb_o3/4);
+    for (uint dd = 0; dd < p.n_dim; ++dd) {
+        dst.data[base + dd] = ss > 0.0 ? o[dd] / ss : 0.0;
+    }
+}
+
+void main() {
+    const uint ir = gl_GlobalInvocationID.x;
+    const uint ihq = ir % p.n_q_head;
+    const uint it  = (ir / p.n_q_head) % p.n_token;
+    const uint is  = ir / (p.n_q_head * p.n_token);
+    const uint ihk = ihq / (p.n_q_head / p.n_kv_head);
+    const float scale = 1.0 / sqrt(float(p.n_dim));
+
+    const uint qbase = ihq*(p.nb_q1/4) + it*(p.nb_q2/4) + is*(p.nb_q3/4);
+    const uint mrow  = it*(p.nb_m1/4) + (is % p.mask_ne3)*(p.nb_m3/4);
+
+    float o[128];
+    float sm = -3.0e38;
+    float ss = 0.0;
+
+    for (uint dd = 0; dd < p.n_dim; ++dd) o[dd] = 0.0;
+    for (uint ib = 0; ib < p.n_block; ++ib) {
+        const int last = int((ib + 1)*p.block_size - 1);
+        if (last >= int(p.n_kv) || !visible(uint(last), mrow)) continue;
+        const uint kb = ihk*(p.nb_ks1/4) + ib*(p.nb_ks2/4) + is*(p.nb_ks3/4);
+        const uint vb = ihk*(p.nb_vs1/4) + ib*(p.nb_vs2/4) + is*(p.nb_vs3/4);
+        attend(o, sm, ss, qbase, kb, vb, true, scale);
+    }
+    write_branch(0, o, ss, ihq, it, is);
+
+    for (uint dd = 0; dd < p.n_dim; ++dd) o[dd] = 0.0;
+    sm = -3.0e38; ss = 0.0;
+    {
+        const uint ibase = ihk*(p.nb_i1/4) + it*(p.nb_i2/4) + is*(p.nb_i3/4);
+        for (uint s = 0; s < p.n_select; ++s) {
+            const int ib = idx.data[ibase + s];
+            if (ib < 0) continue;
+            for (int j = 0; j < int(p.block_size); ++j) {
+                const int ik = ib*int(p.block_size) + j;
+                if (ik >= int(p.n_kv) || !visible(uint(ik), mrow)) continue;
+                const uint kb = ihk*(p.nb_k1/4) + uint(ik)*(p.nb_k2/4) + is*(p.nb_k3/4);
+                const uint vb = ihk*(p.nb_v1/4) + uint(ik)*(p.nb_v2/4) + is*(p.nb_v3/4);
+                attend(o, sm, ss, qbase, kb, vb, false, scale);
+            }
+        }
+    }
+    write_branch(1, o, ss, ihq, it, is);
+
+    for (uint dd = 0; dd < p.n_dim; ++dd) o[dd] = 0.0;
+    sm = -3.0e38; ss = 0.0;
+    {
+        int ik_q = -1;
+        for (int ik = int(p.n_kv) - 1; ik >= 0; --ik) {
+            if (visible(uint(ik), mrow)) { ik_q = ik; break; }
+        }
+        const int ib0 = (p.local_size > 0 && ik_q >= 0) ? max(0, ik_q - int(p.local_size) + 1) : int(p.n_kv);
+        for (int ik = ib0; ik <= ik_q; ++ik) {
+            if (!visible(uint(ik), mrow)) continue;
+            const uint kb = ihk*(p.nb_k1/4) + uint(ik)*(p.nb_k2/4) + is*(p.nb_k3/4);
+            const uint vb = ihk*(p.nb_v1/4) + uint(ik)*(p.nb_v2/4) + is*(p.nb_v3/4);
+            attend(o, sm, ss, qbase, kb, vb, false, scale);
+        }
+    }
+    write_branch(2, o, ss, ihq, it, is);
+}

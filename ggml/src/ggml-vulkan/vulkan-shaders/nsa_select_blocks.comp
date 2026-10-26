@@ -1,0 +1,105 @@
+#version 450
+
+layout(local_size_x = 1) in;
+
+layout(push_constant) uniform P {
+    uint n_dim;
+    uint n_q_head;
+    uint n_kv_head;
+    uint n_block;
+    uint n_kv;
+    uint n_token;
+    uint n_select;
+    uint block_size;
+    uint mask_ne3;
+    uint nb_q1, nb_q2, nb_q3;
+    uint nb_k1, nb_k2, nb_k3;
+    uint nb_m0, nb_m1, nb_m3;
+    uint nb_i1, nb_i2, nb_i3;
+} p;
+
+layout(binding = 0) buffer Q { float data[]; } q;
+layout(binding = 1) buffer K { float data[]; } k;
+layout(binding = 2) buffer M { float data[]; } m;
+layout(binding = 3) buffer I { int   data[]; } idx;
+
+bool visible(uint ik, uint mask_row) {
+    return m.data[mask_row + ik*(p.nb_m0/4)] > -1.0e30;
+}
+
+void main() {
+    const uint ir = gl_GlobalInvocationID.x;
+    const uint ih = ir % p.n_kv_head;
+    const uint it = (ir / p.n_kv_head) % p.n_token;
+    const uint is = ir / (p.n_kv_head * p.n_token);
+    const uint n_group = p.n_q_head / p.n_kv_head;
+    const uint mask_row = it*(p.nb_m1/4) + (is % p.mask_ne3)*(p.nb_m3/4);
+
+    int ik_q = -1;
+    for (int ik = int(p.n_kv) - 1; ik >= 0; --ik) {
+        if (visible(uint(ik), mask_row)) { ik_q = ik; break; }
+    }
+    const int ib_q = ik_q >= 0 ? ik_q / int(p.block_size) : -1;
+
+    float lse[32];
+    for (uint i = 0; i < 32; ++i) lse[i] = 0.0;
+
+    const float scale = 1.0 / sqrt(float(p.n_dim));
+    for (uint ib = 0; ib < p.n_block; ++ib) {
+        const int last = int((ib + 1)*p.block_size - 1);
+        if (last >= int(p.n_kv) || !visible(uint(last), mask_row)) continue;
+        const uint krow = ih*(p.nb_k1/4) + ib*(p.nb_k2/4) + is*(p.nb_k3/4);
+        for (uint iq = 0; iq < n_group; ++iq) {
+            const uint qrow = (ih*n_group + iq)*(p.nb_q1/4) + it*(p.nb_q2/4) + is*(p.nb_q3/4);
+            float dot = 0.0;
+            for (uint dd = 0; dd < p.n_dim; ++dd) dot += q.data[qrow + dd] * k.data[krow + dd];
+            lse[iq] += exp(dot*scale);
+        }
+    }
+    for (uint iq = 0; iq < n_group; ++iq) {
+        lse[iq] = lse[iq] > 0.0 ? log(lse[iq]) : 0.0;
+    }
+
+    float best[32];
+    int   best_i[32];
+    for (uint i = 0; i < 32; ++i) { best[i] = -3.0e38; best_i[i] = -1; }
+
+    const int ib_max = max(int(p.n_block) - 1, ib_q);
+    for (int ib = 0; ib <= ib_max; ++ib) {
+        const int last = (ib + 1)*int(p.block_size) - 1;
+        const bool is_current = (ib == ib_q);
+        const bool complete = (ib < int(p.n_block)) && (last < int(p.n_kv)) && visible(uint(last), mask_row);
+        if (!complete && !is_current) continue;
+
+        float score = 0.0;
+        if (complete) {
+            const uint krow = ih*(p.nb_k1/4) + uint(ib)*(p.nb_k2/4) + is*(p.nb_k3/4);
+            for (uint iq = 0; iq < n_group; ++iq) {
+                const uint qrow = (ih*n_group + iq)*(p.nb_q1/4) + it*(p.nb_q2/4) + is*(p.nb_q3/4);
+                float dot = 0.0;
+                for (uint dd = 0; dd < p.n_dim; ++dd) dot += q.data[qrow + dd] * k.data[krow + dd];
+                score += exp(dot*scale - lse[iq]);
+            }
+        } else {
+            score = float(n_group);
+        }
+        if (ib == 0 || ib == ib_q || ib == ib_q - 1) score += 1.0e9;
+
+        for (uint s = 0; s < p.n_select; ++s) {
+            if (score > best[s]) {
+                for (int j = int(p.n_select) - 1; j > int(s); --j) {
+                    best[j] = best[j - 1];
+                    best_i[j] = best_i[j - 1];
+                }
+                best[s] = score;
+                best_i[s] = ib;
+                break;
+            }
+        }
+    }
+
+    const uint orow = ih*(p.nb_i1/4) + it*(p.nb_i2/4) + is*(p.nb_i3/4);
+    for (uint s = 0; s < p.n_select; ++s) {
+        idx.data[orow + s] = best_i[s];
+    }
+}

@@ -2269,6 +2269,7 @@ struct llama_model_hybrid_gated_deltanet : public llama_model_base {
         ggml_tensor * build_gdn(llm_graph_input_rs * inp, ggml_tensor * cur, int il);
         ggml_tensor * build_nsa(llm_graph_input_attn_kv * inp, ggml_tensor * cur, ggml_tensor * pos, int il);
         const llama_model & model;
+        ggml_tensor * nsa_range = nullptr;
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;

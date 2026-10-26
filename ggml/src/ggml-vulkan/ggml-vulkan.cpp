@@ -1170,6 +1170,10 @@ struct vk_device_struct {
     vk_pipeline pipeline_rwkv_wkv7_f32;
     vk_pipeline pipeline_gated_linear_attn_f32;
     // [size_idx][kda] where size_idx: 0=d16, 1=d32, 2=d64, 3=d128
+    vk_pipeline pipeline_nsa_block_summary_f32;
+    vk_pipeline pipeline_nsa_summary_store_f32;
+    vk_pipeline pipeline_nsa_select_blocks_f32;
+    vk_pipeline pipeline_nsa_attention_f32;
     vk_pipeline pipeline_gated_delta_net[4][2];
     // [size_idx][kda] where size_idx: 0=d32, 1=d64, 2=d128 (no d16 backward; falls back to CPU)
     vk_pipeline pipeline_gated_delta_net_back[3][2];
@@ -2197,6 +2201,62 @@ struct vk_op_gated_delta_net_push_constants {
     uint32_t neq1, rq3;
     float scale;
     uint32_t K;
+};
+
+struct vk_op_nsa_block_summary_push_constants {
+    uint32_t n_dim;
+    uint32_t n_head;
+    uint32_t n_block;
+    uint32_t block_size;
+    uint32_t nb_k1, nb_k2, nb_k3;
+    uint32_t nb_d1, nb_d2, nb_d3;
+};
+
+struct vk_op_nsa_summary_store_push_constants {
+    uint32_t n_dim;
+    uint32_t n_head;
+    uint32_t n_kv;
+    uint32_t n_block;
+    uint32_t block_size;
+    uint32_t nb_k1, nb_k2, nb_k3;
+    uint32_t nb_d1, nb_d2, nb_d3;
+};
+
+struct vk_op_nsa_select_blocks_push_constants {
+    uint32_t n_dim;
+    uint32_t n_q_head;
+    uint32_t n_kv_head;
+    uint32_t n_block;
+    uint32_t n_kv;
+    uint32_t n_token;
+    uint32_t n_select;
+    uint32_t block_size;
+    uint32_t mask_ne3;
+    uint32_t nb_q1, nb_q2, nb_q3;
+    uint32_t nb_k1, nb_k2, nb_k3;
+    uint32_t nb_m0, nb_m1, nb_m3;
+    uint32_t nb_i1, nb_i2, nb_i3;
+};
+
+struct vk_op_nsa_attention_push_constants {
+    uint32_t n_dim;
+    uint32_t n_q_head;
+    uint32_t n_kv_head;
+    uint32_t n_kv;
+    uint32_t n_token;
+    uint32_t n_block;
+    uint32_t n_select;
+    uint32_t block_size;
+    uint32_t local_size;
+    uint32_t mask_ne3;
+    uint32_t nb_q1, nb_q2, nb_q3;
+    uint32_t nb_k1, nb_k2, nb_k3;
+    uint32_t nb_v1, nb_v2, nb_v3;
+    uint32_t nb_ks1, nb_ks2, nb_ks3;
+    uint32_t nb_vs1, nb_vs2, nb_vs3;
+    uint32_t nb_m0, nb_m1, nb_m3;
+    uint32_t nb_i1, nb_i2, nb_i3;
+    uint32_t nb_o1, nb_o2, nb_o3;
 };
 
 struct vk_op_gated_delta_net_back_push_constants {
@@ -7082,6 +7142,11 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
             }
         }
     }
+
+    ggml_vk_create_pipeline(device, device->pipeline_nsa_block_summary_f32, "nsa_block_summary_f32", nsa_block_summary_f32_len, nsa_block_summary_f32_data, "main", 2, sizeof(vk_op_nsa_block_summary_push_constants), {1, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_nsa_summary_store_f32, "nsa_summary_store_f32", nsa_summary_store_f32_len, nsa_summary_store_f32_data, "main", 3, sizeof(vk_op_nsa_summary_store_push_constants), {1, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_nsa_select_blocks_f32, "nsa_select_blocks_f32", nsa_select_blocks_f32_len, nsa_select_blocks_f32_data, "main", 4, sizeof(vk_op_nsa_select_blocks_push_constants), {1, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_nsa_attention_f32, "nsa_attention_f32", nsa_attention_f32_len, nsa_attention_f32_data, "main", 8, sizeof(vk_op_nsa_attention_push_constants), {1, 1, 1}, {}, 1);
 
     if (device->subgroup_arithmetic && device->subgroup_require_full_support) {
         ggml_vk_create_pipeline(device, device->pipeline_ssm_scan_f32_d128, "ssm_scan_128_f32", ssm_scan_subgroup_f32_len, ssm_scan_subgroup_f32_data, "main", 8, sizeof(vk_op_ssm_scan_push_constants), {1, 1, 1}, {128, device->subgroup_size}, 1, true, true);
@@ -13729,6 +13794,14 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
             return ctx->device->pipeline_gated_linear_attn_f32;
         }
         return nullptr;
+    case GGML_OP_NSA_BLOCK_SUMMARY:
+        return ctx->device->pipeline_nsa_block_summary_f32;
+    case GGML_OP_NSA_SUMMARY_STORE:
+        return ctx->device->pipeline_nsa_summary_store_f32;
+    case GGML_OP_NSA_SELECT_BLOCKS:
+        return ctx->device->pipeline_nsa_select_blocks_f32;
+    case GGML_OP_NSA_ATTENTION:
+        return ctx->device->pipeline_nsa_attention_f32;
     case GGML_OP_GATED_DELTA_NET:
         if (src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
             const uint32_t S_v = dst->src[2]->ne[0];
@@ -15148,6 +15221,138 @@ static void ggml_vk_gated_linear_attn(ggml_backend_vk_context * ctx, vk_context&
     ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
         {src_buf[0], src_buf[1], src_buf[2], src_buf[3], src_buf[4], dst_buf},
         pc, { (uint32_t)(n_seqs * n_heads), 1, 1 });
+}
+
+static void ggml_vk_nsa_block_summary(ggml_backend_vk_context * ctx, vk_context & subctx, ggml_tensor * dst) {
+    const ggml_tensor * k = dst->src[0];
+
+    vk_pipeline pipeline = ggml_vk_op_get_pipeline(ctx, k, nullptr, nullptr, dst, dst->op);
+    GGML_ASSERT(pipeline != nullptr);
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    vk_subbuffer k_buf = ggml_vk_tensor_subbuffer(ctx, k);
+    vk_subbuffer d_buf = ggml_vk_tensor_subbuffer(ctx, dst);
+
+    const vk_op_nsa_block_summary_push_constants pc = {
+        (uint32_t) k->ne[0],
+        (uint32_t) k->ne[1],
+        (uint32_t) dst->ne[2],
+        (uint32_t) ggml_get_op_params_i32(dst, 0),
+        (uint32_t) k->nb[1], (uint32_t) k->nb[2], (uint32_t) k->nb[3],
+        (uint32_t) dst->nb[1], (uint32_t) dst->nb[2], (uint32_t) dst->nb[3],
+    };
+
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, {k_buf, d_buf}, pc,
+        { (uint32_t)(k->ne[1] * dst->ne[2] * k->ne[3]), 1, 1 });
+}
+
+static void ggml_vk_nsa_summary_store(ggml_backend_vk_context * ctx, vk_context & subctx, ggml_tensor * dst) {
+    const ggml_tensor * k = dst->src[0];
+    const ggml_tensor * summ = dst->src[1];
+    const ggml_tensor * range = dst->src[2];
+
+    vk_pipeline pipeline = ggml_vk_op_get_pipeline(ctx, k, summ, range, dst, dst->op);
+    GGML_ASSERT(pipeline != nullptr);
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    vk_subbuffer k_buf = ggml_vk_tensor_subbuffer(ctx, k);
+    vk_subbuffer dst_buf = ggml_vk_tensor_subbuffer(ctx, dst);
+    vk_subbuffer r_buf = ggml_vk_tensor_subbuffer(ctx, range);
+
+    const vk_op_nsa_summary_store_push_constants pc = {
+        (uint32_t) k->ne[0],
+        (uint32_t) k->ne[1],
+        (uint32_t) k->ne[2],
+        (uint32_t) summ->ne[2],
+        (uint32_t) ggml_get_op_params_i32(dst, 0),
+        (uint32_t) k->nb[1], (uint32_t) k->nb[2], (uint32_t) k->nb[3],
+        (uint32_t) dst->nb[1], (uint32_t) dst->nb[2], (uint32_t) dst->nb[3],
+    };
+
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, {k_buf, dst_buf, r_buf}, pc,
+        { (uint32_t)(k->ne[1] * k->ne[3] * summ->ne[2]), 1, 1 });
+}
+
+static void ggml_vk_nsa_select_blocks(ggml_backend_vk_context * ctx, vk_context & subctx, ggml_tensor * dst) {
+    const ggml_tensor * q = dst->src[0];
+    const ggml_tensor * ks = dst->src[1];
+    const ggml_tensor * mask = dst->src[2];
+
+    vk_pipeline pipeline = ggml_vk_op_get_pipeline(ctx, q, ks, mask, dst, dst->op);
+    GGML_ASSERT(pipeline != nullptr);
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    vk_subbuffer q_buf = ggml_vk_tensor_subbuffer(ctx, q);
+    vk_subbuffer k_buf = ggml_vk_tensor_subbuffer(ctx, ks);
+    vk_subbuffer m_buf = ggml_vk_tensor_subbuffer(ctx, mask);
+    vk_subbuffer d_buf = ggml_vk_tensor_subbuffer(ctx, dst);
+
+    const vk_op_nsa_select_blocks_push_constants pc = {
+        (uint32_t) q->ne[0],
+        (uint32_t) q->ne[1],
+        (uint32_t) ks->ne[1],
+        (uint32_t) ks->ne[2],
+        (uint32_t) mask->ne[0],
+        (uint32_t) q->ne[2],
+        (uint32_t) dst->ne[0],
+        (uint32_t) ggml_get_op_params_i32(dst, 0),
+        (uint32_t) mask->ne[3],
+        (uint32_t) q->nb[1], (uint32_t) q->nb[2], (uint32_t) q->nb[3],
+        (uint32_t) ks->nb[1], (uint32_t) ks->nb[2], (uint32_t) ks->nb[3],
+        (uint32_t) mask->nb[0], (uint32_t) mask->nb[1], (uint32_t) mask->nb[3],
+        (uint32_t) dst->nb[1], (uint32_t) dst->nb[2], (uint32_t) dst->nb[3],
+    };
+
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, {q_buf, k_buf, m_buf, d_buf}, pc,
+        { (uint32_t)(ks->ne[1] * q->ne[2] * q->ne[3]), 1, 1 });
+}
+
+static void ggml_vk_nsa_attention(ggml_backend_vk_context * ctx, vk_context & subctx, ggml_tensor * dst) {
+    const ggml_tensor * q = dst->src[0];
+    const ggml_tensor * k = dst->src[1];
+    const ggml_tensor * v = dst->src[2];
+    const ggml_tensor * ks = dst->src[3];
+    const ggml_tensor * vs = dst->src[4];
+    const ggml_tensor * idx = dst->src[5];
+    const ggml_tensor * mask = dst->src[6];
+
+    vk_pipeline pipeline = ggml_vk_op_get_pipeline(ctx, q, k, v, dst, dst->op);
+    GGML_ASSERT(pipeline != nullptr);
+    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
+
+    vk_subbuffer q_buf = ggml_vk_tensor_subbuffer(ctx, q);
+    vk_subbuffer k_buf = ggml_vk_tensor_subbuffer(ctx, k);
+    vk_subbuffer v_buf = ggml_vk_tensor_subbuffer(ctx, v);
+    vk_subbuffer ks_buf = ggml_vk_tensor_subbuffer(ctx, ks);
+    vk_subbuffer vs_buf = ggml_vk_tensor_subbuffer(ctx, vs);
+    vk_subbuffer i_buf = ggml_vk_tensor_subbuffer(ctx, idx);
+    vk_subbuffer m_buf = ggml_vk_tensor_subbuffer(ctx, mask);
+    vk_subbuffer d_buf = ggml_vk_tensor_subbuffer(ctx, dst);
+
+    const vk_op_nsa_attention_push_constants pc = {
+        (uint32_t) q->ne[0],
+        (uint32_t) q->ne[1],
+        (uint32_t) k->ne[1],
+        (uint32_t) mask->ne[0],
+        (uint32_t) q->ne[2],
+        (uint32_t) ks->ne[2],
+        (uint32_t) idx->ne[0],
+        (uint32_t) ggml_get_op_params_i32(dst, 0),
+        (uint32_t) ggml_get_op_params_i32(dst, 1),
+        (uint32_t) mask->ne[3],
+        (uint32_t) q->nb[1], (uint32_t) q->nb[2], (uint32_t) q->nb[3],
+        (uint32_t) k->nb[1], (uint32_t) k->nb[2], (uint32_t) k->nb[3],
+        (uint32_t) v->nb[1], (uint32_t) v->nb[2], (uint32_t) v->nb[3],
+        (uint32_t) ks->nb[1], (uint32_t) ks->nb[2], (uint32_t) ks->nb[3],
+        (uint32_t) vs->nb[1], (uint32_t) vs->nb[2], (uint32_t) vs->nb[3],
+        (uint32_t) mask->nb[0], (uint32_t) mask->nb[1], (uint32_t) mask->nb[3],
+        (uint32_t) idx->nb[1], (uint32_t) idx->nb[2], (uint32_t) idx->nb[3],
+        (uint32_t) dst->nb[1], (uint32_t) dst->nb[2], (uint32_t) dst->nb[3],
+    };
+
+    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline,
+        {q_buf, k_buf, v_buf, ks_buf, vs_buf, i_buf, m_buf, d_buf}, pc,
+        { (uint32_t)(q->ne[1] * q->ne[2] * q->ne[3]), 1, 1 });
 }
 
 static void ggml_vk_gated_delta_net(ggml_backend_vk_context * ctx, vk_context& subctx, ggml_tensor * dst) {
@@ -18537,6 +18742,25 @@ static bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgr
 
         break;
 
+    case GGML_OP_NSA_BLOCK_SUMMARY:
+        ggml_vk_nsa_block_summary(ctx, compute_ctx, node);
+        break;
+
+    case GGML_OP_NSA_SUMMARY_STORE:
+        ggml_vk_nsa_summary_store(ctx, compute_ctx, node);
+
+        break;
+
+    case GGML_OP_NSA_SELECT_BLOCKS:
+        ggml_vk_nsa_select_blocks(ctx, compute_ctx, node);
+
+        break;
+
+    case GGML_OP_NSA_ATTENTION:
+        ggml_vk_nsa_attention(ctx, compute_ctx, node);
+
+        break;
+
     case GGML_OP_GATED_DELTA_NET:
         ggml_vk_gated_delta_net(ctx, compute_ctx, node);
 
@@ -21755,6 +21979,32 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
         case GGML_OP_GATED_LINEAR_ATTN:
             // the shader block size is hardcoded to head_size 64
             return op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 && op->src[0]->ne[0] == 64;
+        case GGML_OP_NSA_BLOCK_SUMMARY:
+            return op->src[0]->type == GGML_TYPE_F32 &&
+                   op->type == GGML_TYPE_F32 &&
+                   op->src[0]->ne[0] <= 128;
+        case GGML_OP_NSA_SUMMARY_STORE:
+            return op->src[0]->type == GGML_TYPE_F32 &&
+                   op->src[1]->type == GGML_TYPE_F32 &&
+                   op->src[2]->type == GGML_TYPE_I32 &&
+                   op->type == GGML_TYPE_F32 &&
+                   op->src[0]->ne[0] <= 128;
+        case GGML_OP_NSA_SELECT_BLOCKS:
+            return op->src[0]->type == GGML_TYPE_F32 &&
+                   op->src[1]->type == GGML_TYPE_F32 &&
+                   op->src[2]->type == GGML_TYPE_F32 &&
+                   op->type == GGML_TYPE_I32 &&
+                   op->src[0]->ne[0] <= 128;
+        case GGML_OP_NSA_ATTENTION:
+            return op->src[0]->type == GGML_TYPE_F32 &&
+                   op->src[1]->type == GGML_TYPE_F32 &&
+                   op->src[2]->type == GGML_TYPE_F32 &&
+                   op->src[3]->type == GGML_TYPE_F32 &&
+                   op->src[4]->type == GGML_TYPE_F32 &&
+                   op->src[5]->type == GGML_TYPE_I32 &&
+                   op->src[6]->type == GGML_TYPE_F32 &&
+                   op->type == GGML_TYPE_F32 &&
+                   op->src[0]->ne[0] <= 128;
         case GGML_OP_GATED_DELTA_NET:
             {
                 const uint32_t S_v = op->src[2]->ne[0];

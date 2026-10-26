@@ -14711,3 +14711,342 @@ template [[host_name("kernel_nsa_summary_f16")]]   kernel kernel_nsa_summary_hal
 template [[host_name("kernel_nsa_summary_f32")]]   kernel kernel_nsa_summary_float_t kernel_nsa_summary<float>;
 template [[host_name("kernel_nsa_attention_f16")]] kernel kernel_nsa_attention_half_t  kernel_nsa_attention<half>;
 template [[host_name("kernel_nsa_attention_f32")]] kernel kernel_nsa_attention_float_t kernel_nsa_attention<float>;
+
+template<typename T>
+kernel void kernel_nsa_summary_store(
+        constant ggml_metal_kargs_nsa & args,
+        device const char * k     [[buffer(1)]],
+        device float      * dst   [[buffer(2)]],
+        device const int  * range [[buffer(3)]],
+        uint3 tgpig [[threadgroup_position_in_grid]]) {
+    const int ir = (int) tgpig.x;
+    const int ib = ir % args.n_block;
+    const int ih = (ir/args.n_block) % args.n_kv_head;
+    const int is = ir/(args.n_block*args.n_kv_head);
+
+    const int ib0 = range[0];
+    const int ib1 = range[1];
+    if (ib < ib0 || ib >= ib1 || (ib + 1)*args.block_size > args.n_kv) {
+        return;
+    }
+
+    device float * out = (device float *) ((device char *) dst + ih*args.nb_ks1 + ib*args.nb_ks2 + is*args.nb_ks3);
+    for (int d = 0; d < args.n_dim; ++d) {
+        out[d] = 0.0f;
+    }
+    for (int j = 0; j < args.block_size; ++j) {
+        device const char * p = k + ih*args.nb_k1 + (uint64_t)(ib*args.block_size + j)*args.nb_k2 + is*args.nb_k3;
+        device const T * row = (device const T *) p;
+        for (int d = 0; d < args.n_dim; ++d) {
+            out[d] += (float) row[d];
+        }
+    }
+    for (int d = 0; d < args.n_dim; ++d) {
+        out[d] /= args.block_size;
+    }
+}
+
+typedef decltype(kernel_nsa_summary_store<half>)  kernel_nsa_summary_store_half_t;
+typedef decltype(kernel_nsa_summary_store<float>) kernel_nsa_summary_store_float_t;
+
+template [[host_name("kernel_nsa_summary_store_f16")]] kernel kernel_nsa_summary_store_half_t  kernel_nsa_summary_store<half>;
+template [[host_name("kernel_nsa_summary_store_f32")]] kernel kernel_nsa_summary_store_float_t kernel_nsa_summary_store<float>;
+
+template<typename T>
+static inline void kernel_nsa_attend_tg(
+        device const float * q,
+        uint lane,
+        int n_dim,
+        device const char * krow,
+        device const char * vrow,
+        thread float & m,
+        thread float & s,
+        thread float & o0,
+        thread float & o1) {
+    device const T * kk = (device const T *) krow;
+    device const T * vv = (device const T *) vrow;
+    float dot = q[lane] * (float) kk[lane];
+    if (n_dim > 32) {
+        dot += q[lane + 32] * (float) kk[lane + 32];
+    }
+    const float score = simd_sum(dot) * (1.0f/sqrt((float) n_dim));
+    const float nm = MAX(m, score);
+    const float pr = exp(m - nm);
+    const float w  = exp(score - nm);
+    o0 = o0*pr + w*(float) vv[lane];
+    if (n_dim > 32) {
+        o1 = o1*pr + w*(float) vv[lane + 32];
+    }
+    s = s*pr + w;
+    m = nm;
+}
+
+template<typename T>
+kernel void kernel_nsa_attention_tg(
+        constant ggml_metal_kargs_nsa & args,
+        device const float * q    [[buffer(1)]],
+        device const char  * k    [[buffer(2)]],
+        device const char  * v    [[buffer(3)]],
+        device const float * ks   [[buffer(4)]],
+        device const float * vs   [[buffer(5)]],
+        device const int   * idx  [[buffer(6)]],
+        device const char  * mask [[buffer(7)]],
+        device float       * dst  [[buffer(8)]],
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        uint lane [[thread_index_in_threadgroup]]) {
+    if (lane >= 32) return;
+
+    const int ir = (int) tgpig.x;
+    const int ihq = ir % args.n_q_head;
+    const int it  = (ir/args.n_q_head) % args.n_token;
+    const int is  = ir/(args.n_q_head*args.n_token);
+    const int ihk = ihq/(args.n_q_head/args.n_kv_head);
+
+    device const float * qv = (device const float *) ((device const char *) q + (uint64_t) ihq*args.nb_q1 + (uint64_t) it*args.nb_q2 + (uint64_t) is*args.nb_q3);
+    device const char * mrow = mask + (uint64_t) it*args.nb_m1 + (uint64_t)(is % args.mask_ne3)*args.nb_m3;
+    #define NSA_VIS_TG(ik) kernel_nsa_visible(mrow, (ik), args.nb_m0, args.mask_f16)
+    #define NSA_K_TG(ik) ((device const char *) k + ihk*args.nb_k1 + (uint64_t)(ik)*args.nb_k2 + is*args.nb_k3)
+    #define NSA_V_TG(ik) ((device const char *) v + ihk*args.nb_v1 + (uint64_t)(ik)*args.nb_v2 + is*args.nb_v3)
+    #define NSA_WRITE_TG(br, oo0, oo1, ss) do { \
+        device float * oo = (device float *) ((device char *) dst + (uint64_t) ihq*args.nb_o1 + \
+                (uint64_t)((br)*args.n_token + it)*args.nb_o2 + (uint64_t) is*args.nb_o3); \
+        if (ss > 0.0f) { oo0 /= ss; oo1 /= ss; } \
+        oo[lane] = oo0; \
+        if (args.n_dim > 32) oo[lane + 32] = oo1; \
+    } while (0)
+
+    float m = -INFINITY;
+    float s = 0.0f;
+    float o0 = 0.0f;
+    float o1 = 0.0f;
+
+    for (int ib = 0; ib < args.n_block; ++ib) {
+        const int last = (ib + 1)*args.block_size - 1;
+        if (last >= args.n_kv || !NSA_VIS_TG(last)) continue;
+        device const char * kr = (device const char *) ks + ihk*args.nb_ks1 + ib*args.nb_ks2 + is*args.nb_ks3;
+        device const char * vr = (device const char *) vs + ihk*args.nb_vs1 + ib*args.nb_vs2 + is*args.nb_vs3;
+        kernel_nsa_attend_tg<float>(qv, lane, args.n_dim, kr, vr, m, s, o0, o1);
+    }
+    NSA_WRITE_TG(0, o0, o1, s);
+
+    m = -INFINITY; s = 0.0f; o0 = 0.0f; o1 = 0.0f;
+    {
+        device const int * sel = (device const int *) ((device const char *) idx + ihk*args.nb_i1 + (uint64_t) it*args.nb_i2 + is*args.nb_i3);
+        for (int i = 0; i < args.n_select; ++i) {
+            const int ib = sel[i];
+            if (ib < 0) continue;
+            for (int j = 0; j < args.block_size; ++j) {
+                const int ik = ib*args.block_size + j;
+                if (ik >= args.n_kv || !NSA_VIS_TG(ik)) continue;
+                kernel_nsa_attend_tg<T>(qv, lane, args.n_dim, NSA_K_TG(ik), NSA_V_TG(ik), m, s, o0, o1);
+            }
+        }
+    }
+    NSA_WRITE_TG(1, o0, o1, s);
+
+    m = -INFINITY; s = 0.0f; o0 = 0.0f; o1 = 0.0f;
+    {
+        int ik_q = -1;
+        for (int ik = args.n_kv - 1; ik >= 0; --ik) {
+            if (NSA_VIS_TG(ik)) { ik_q = ik; break; }
+        }
+        const int ib_begin = (args.local_size > 0 && ik_q >= 0) ? MAX(0, ik_q - args.local_size + 1) : args.n_kv;
+        for (int ik = ib_begin; ik <= ik_q; ++ik) {
+            if (!NSA_VIS_TG(ik)) continue;
+            kernel_nsa_attend_tg<T>(qv, lane, args.n_dim, NSA_K_TG(ik), NSA_V_TG(ik), m, s, o0, o1);
+        }
+    }
+    NSA_WRITE_TG(2, o0, o1, s);
+
+    #undef NSA_WRITE_TG
+    #undef NSA_K_TG
+    #undef NSA_V_TG
+    #undef NSA_VIS_TG
+}
+
+template<typename T>
+kernel void kernel_nsa_summary_store_tg(
+        constant ggml_metal_kargs_nsa & args,
+        device const char * k     [[buffer(1)]],
+        device float      * dst   [[buffer(2)]],
+        device const int  * range [[buffer(3)]],
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        uint lane [[thread_index_in_threadgroup]]) {
+    if (lane >= 32) return;
+    const int ir = (int) tgpig.x;
+    const int ib = ir % args.n_block;
+    const int ih = (ir/args.n_block) % args.n_kv_head;
+    const int is = ir/(args.n_block*args.n_kv_head);
+
+    const int ib0 = range[0];
+    const int ib1 = range[1];
+    if (ib < ib0 || ib >= ib1 || (ib + 1)*args.block_size > args.n_kv) {
+        return;
+    }
+
+    device float * out = (device float *) ((device char *) dst + ih*args.nb_ks1 + ib*args.nb_ks2 + is*args.nb_ks3);
+    float a0 = 0.0f;
+    float a1 = 0.0f;
+    for (int j = 0; j < args.block_size; ++j) {
+        device const char * p = k + ih*args.nb_k1 + (uint64_t)(ib*args.block_size + j)*args.nb_k2 + is*args.nb_k3;
+        device const T * row = (device const T *) p;
+        a0 += (float) row[lane];
+        if (args.n_dim > 32) a1 += (float) row[lane + 32];
+    }
+    out[lane] = a0 / args.block_size;
+    if (args.n_dim > 32) out[lane + 32] = a1 / args.block_size;
+}
+
+typedef decltype(kernel_nsa_attention_tg<half>)  kernel_nsa_attention_tg_half_t;
+typedef decltype(kernel_nsa_attention_tg<float>) kernel_nsa_attention_tg_float_t;
+typedef decltype(kernel_nsa_summary_store_tg<half>)  kernel_nsa_summary_store_tg_half_t;
+typedef decltype(kernel_nsa_summary_store_tg<float>) kernel_nsa_summary_store_tg_float_t;
+
+template [[host_name("kernel_nsa_attention_tg_f16")]] kernel kernel_nsa_attention_tg_half_t  kernel_nsa_attention_tg<half>;
+template [[host_name("kernel_nsa_attention_tg_f32")]] kernel kernel_nsa_attention_tg_float_t kernel_nsa_attention_tg<float>;
+template [[host_name("kernel_nsa_summary_store_tg_f16")]] kernel kernel_nsa_summary_store_tg_half_t  kernel_nsa_summary_store_tg<half>;
+template [[host_name("kernel_nsa_summary_store_tg_f32")]] kernel kernel_nsa_summary_store_tg_float_t kernel_nsa_summary_store_tg<float>;
+
+static inline bool kernel_nsa_select_visible(device const char * row, int ik, uint64_t nb0, int is_f16) {
+    const device char * p = row + (uint64_t) ik*nb0;
+    if (is_f16) {
+        return isfinite((float) *(device const half *) p);
+    }
+    return isfinite(*(device const float *) p);
+}
+
+kernel void kernel_nsa_select_tg(
+        constant ggml_metal_kargs_nsa & args,
+        device const float * q    [[buffer(1)]],
+        device const float * ks   [[buffer(2)]],
+        device const char  * mask [[buffer(3)]],
+        device int         * out  [[buffer(4)]],
+        uint3 tgpig [[threadgroup_position_in_grid]],
+        uint lane [[thread_index_in_threadgroup]]) {
+    if (lane >= 32) return;
+
+    threadgroup int   sh_ik_q;
+    threadgroup float sh_top_s[32*32];
+    threadgroup int   sh_top_i[32*32];
+
+    const int ir = (int) tgpig.x;
+    const int ih = ir % args.n_kv_head;
+    const int it = (ir/args.n_kv_head) % args.n_token;
+    const int is = ir/(args.n_kv_head*args.n_token);
+    const int n_group = args.n_q_head/args.n_kv_head;
+    const int bs = args.block_size;
+    const int n_kv = args.n_kv;
+    const int n_sel = args.n_select;
+
+    device const char * mrow = mask + (uint64_t) it*args.nb_m1 + (uint64_t)(is % args.mask_ne3)*args.nb_m3;
+
+    if (lane == 0) {
+        int ik_q = -1;
+        for (int ik = n_kv - 1; ik >= 0; --ik) {
+            if (kernel_nsa_select_visible(mrow, ik, args.nb_m0, args.mask_f16)) { ik_q = ik; break; }
+        }
+        sh_ik_q = ik_q;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const int ik_q = sh_ik_q;
+    const int ib_q = ik_q >= 0 ? ik_q/bs : -1;
+    const float scale = 1.0f/sqrt((float) args.n_dim);
+
+    // first pass: normalizer over complete blocks
+    float local_sum[32];
+    for (int i = 0; i < 32; ++i) local_sum[i] = 0.0f;
+    for (int ib = lane; ib < args.n_block; ib += 32) {
+        const int last = (ib + 1)*bs - 1;
+        if (last >= n_kv || !kernel_nsa_select_visible(mrow, last, args.nb_m0, args.mask_f16)) continue;
+        device const float * krow = (device const float *) ((device const char *) ks + ih*args.nb_ks1 + ib*args.nb_ks2 + is*args.nb_ks3);
+        for (int iq = 0; iq < n_group; ++iq) {
+            device const float * qrow = (device const float *) ((device const char *) q + (uint64_t)(ih*n_group + iq)*args.nb_q1 + (uint64_t) it*args.nb_q2 + (uint64_t) is*args.nb_q3);
+            float dot = 0.0f;
+            for (int d = 0; d < args.n_dim; ++d) dot += qrow[d]*krow[d];
+            local_sum[iq] += exp(dot*scale);
+        }
+    }
+
+    float lse[32];
+    for (int iq = 0; iq < n_group; ++iq) {
+        const float total = simd_sum(local_sum[iq]);
+        lse[iq] = total > 0.0f ? log(total) : 0.0f;
+    }
+
+    // second pass: block scores and local top-k
+    float best[32];
+    int   best_i[32];
+    for (int i = 0; i < 32; ++i) {
+        best[i] = -INFINITY;
+        best_i[i] = -1;
+    }
+    for (int ib = lane; ib < args.n_block; ib += 32) {
+        const int last = (ib + 1)*bs - 1;
+        const bool is_current = (ib == ib_q);
+        const bool complete = (ib < args.n_block) && (last < n_kv) && kernel_nsa_select_visible(mrow, last, args.nb_m0, args.mask_f16);
+        if (!complete && !is_current) continue;
+
+        float score = 0.0f;
+        if (complete) {
+            device const float * krow = (device const float *) ((device const char *) ks + ih*args.nb_ks1 + ib*args.nb_ks2 + is*args.nb_ks3);
+            for (int iq = 0; iq < n_group; ++iq) {
+                device const float * qrow = (device const float *) ((device const char *) q + (uint64_t)(ih*n_group + iq)*args.nb_q1 + (uint64_t) it*args.nb_q2 + (uint64_t) is*args.nb_q3);
+                float dot = 0.0f;
+                for (int d = 0; d < args.n_dim; ++d) dot += qrow[d]*krow[d];
+                score += exp(dot*scale - lse[iq]);
+            }
+        } else {
+            score = (float) n_group;
+        }
+        if (ib == 0 || ib == ib_q || ib == ib_q - 1) score += 1.0e9f;
+
+        for (int s = 0; s < n_sel; ++s) {
+            if (score > best[s]) {
+                for (int j = n_sel - 1; j > s; --j) {
+                    best[j] = best[j - 1];
+                    best_i[j] = best_i[j - 1];
+                }
+                best[s] = score;
+                best_i[s] = ib;
+                break;
+            }
+        }
+    }
+
+    for (int s = 0; s < n_sel; ++s) {
+        sh_top_s[lane*32 + s] = best[s];
+        sh_top_i[lane*32 + s] = best_i[s];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (lane == 0) {
+        float fbest[32];
+        int   fbest_i[32];
+        for (int i = 0; i < 32; ++i) {
+            fbest[i] = -INFINITY;
+            fbest_i[i] = -1;
+        }
+        for (int l = 0; l < 32; ++l) {
+            for (int s = 0; s < n_sel; ++s) {
+                const float score = sh_top_s[l*32 + s];
+                const int   ib    = sh_top_i[l*32 + s];
+                if (ib < 0) continue;
+                for (int k = 0; k < n_sel; ++k) {
+                    if (score > fbest[k]) {
+                        for (int j = n_sel - 1; j > k; --j) {
+                            fbest[j] = fbest[j - 1];
+                            fbest_i[j] = fbest_i[j - 1];
+                        }
+                        fbest[k] = score;
+                        fbest_i[k] = ib;
+                        break;
+                    }
+                }
+            }
+        }
+        device int * o = (device int *) ((device char *) out + ih*args.nb_i1 + (uint64_t) it*args.nb_i2 + is*args.nb_i3);
+        for (int s = 0; s < n_sel; ++s) {
+            o[s] = fbest_i[s];
+        }
+    }
+}

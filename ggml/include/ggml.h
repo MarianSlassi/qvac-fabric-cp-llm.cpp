@@ -590,6 +590,7 @@ extern "C" {
         GGML_OP_GATED_DELTA_NET_BACK,
         GGML_OP_LIGHTNING_INDEXER,
         GGML_OP_NSA_BLOCK_SUMMARY,
+        GGML_OP_NSA_SUMMARY_STORE,
         GGML_OP_NSA_SELECT_BLOCKS,
         GGML_OP_NSA_ATTENTION,
         GGML_OP_DSV4_HC_COMB,
@@ -2719,6 +2720,13 @@ extern "C" {
     GGML_API struct ggml_tensor * ggml_nsa_block_summary(
         struct ggml_context * ctx,
         struct ggml_tensor  * kv,
+        int32_t               block_size);
+
+    GGML_API struct ggml_tensor * ggml_nsa_summary_store(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * k_summary,
+        struct ggml_tensor  * range,
         int32_t               block_size);
 
     GGML_API struct ggml_tensor * ggml_nsa_select_blocks(

@@ -624,6 +624,16 @@ public:
     const llama_cross * cross = nullptr;
 };
 
+class llm_graph_input_nsa : public llm_graph_input_i {
+public:
+    llm_graph_input_nsa(ggml_tensor * range, uint32_t block_size) : range(range), block_size(block_size) {}
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    ggml_tensor * range;
+    uint32_t block_size;
+};
+
 class llm_graph_input_mem_hybrid : public llm_graph_input_i {
 public:
     llm_graph_input_mem_hybrid(

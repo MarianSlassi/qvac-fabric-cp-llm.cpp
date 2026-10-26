@@ -1028,6 +1028,7 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                 split_state = handle_lightning_indexer(src_ss);
             } break;
             case GGML_OP_NSA_BLOCK_SUMMARY:
+            case GGML_OP_NSA_SUMMARY_STORE:
             case GGML_OP_NSA_SELECT_BLOCKS:
             case GGML_OP_NSA_ATTENTION: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ true);

@@ -27,9 +27,12 @@ cmake -S "$ROOT" -B "$BUILD" \
     -DLLAMA_BUILD_SERVER=OFF >/dev/null
 
 cmake --build "$BUILD" -j "${NSA_JOBS:-8}" \
-    --target test-nsa-ops test-nsa-model llama-completion llama-bench >/dev/null
+    --target test-gdn-op test-nsa-ops test-nsa-model llama-completion llama-bench >/dev/null
 
-echo "== operators (CPU + GPU) =="
+echo "== GDN op =="
+"$BUILD/bin/test-gdn-op"
+
+echo "== NSA operators (CPU + GPU) =="
 "$BUILD/bin/test-nsa-ops"
 
 echo "== model, CPU =="
@@ -37,6 +40,15 @@ NSA_TEST_MODEL="$MODEL" "$BUILD/bin/test-nsa-model" /tmp/nsa_cpu.bin
 
 echo "== model, Metal =="
 NSA_TEST_GPU_LAYERS=99 NSA_TEST_MODEL="$MODEL" "$BUILD/bin/test-nsa-model" /tmp/nsa_gpu.bin
+
+if [[ -n "${NSA_VULKAN_BUILD:-}" ]]; then
+    echo "== operators, Vulkan =="
+    "$NSA_VULKAN_BUILD/bin/test-nsa-ops"
+
+    echo "== model, Vulkan =="
+    NSA_TEST_GPU_LAYERS=99 NSA_TEST_KV_F32=1 NSA_TEST_MODEL="$MODEL" \
+        "$NSA_VULKAN_BUILD/bin/test-nsa-model" /tmp/nsa_vk.bin
+fi
 
 echo "== PyTorch reference =="
 uv run --project "$ROOT" python "$ROOT/tests/nsa_reference.py" \

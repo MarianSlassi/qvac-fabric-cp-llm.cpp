@@ -353,6 +353,7 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
                 n_fuse = ggml_metal_op_lightning_indexer(ctx, idx);
             } break;
         case GGML_OP_NSA_BLOCK_SUMMARY:
+        case GGML_OP_NSA_SUMMARY_STORE:
         case GGML_OP_NSA_SELECT_BLOCKS:
         case GGML_OP_NSA_ATTENTION:
             {
@@ -1663,6 +1664,42 @@ int ggml_metal_op_nsa(ggml_metal_op_t ctx, int idx) {
                 ggml_metal_encoder_set_bytes(enc, &args, sizeof(args), 0);
 
                 const int n_rows = args.n_kv_head*args.n_block*args.n_stream;
+                const int n_threads = args.n_dim == 64 ? 32 : 1;
+                ggml_metal_encoder_dispatch_threadgroups(enc, n_rows, 1, 1, n_threads, 1, 1);
+            } break;
+        case GGML_OP_NSA_SUMMARY_STORE:
+            {
+                const ggml_tensor * k    = op->src[0];
+                const ggml_tensor * summ = op->src[1];
+                const ggml_tensor * range = op->src[2];
+                GGML_ASSERT((k->type == GGML_TYPE_F32 || k->type == GGML_TYPE_F16));
+                GGML_ASSERT(summ->type == GGML_TYPE_F32);
+                GGML_ASSERT(range->type == GGML_TYPE_I32);
+                GGML_ASSERT(op->type == GGML_TYPE_F32);
+
+                args.n_dim      = (int32_t) k->ne[0];
+                args.n_kv_head  = (int32_t) k->ne[1];
+                args.n_kv       = (int32_t) k->ne[2];
+                args.n_stream   = (int32_t) k->ne[3];
+                args.n_block    = (int32_t) summ->ne[2];
+                args.block_size = ggml_get_op_params_i32(op, 0);
+
+                args.nb_k1  = k->nb[1];
+                args.nb_k2  = k->nb[2];
+                args.nb_k3  = k->nb[3];
+                args.nb_ks1 = summ->nb[1];
+                args.nb_ks2 = summ->nb[2];
+                args.nb_ks3 = summ->nb[3];
+
+                ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(k),     1);
+                ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(summ),  2);
+                ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(range), 3);
+
+                auto pipeline = ggml_metal_library_get_pipeline_nsa(ctx->lib, op);
+                ggml_metal_encoder_set_pipeline(enc, pipeline);
+                ggml_metal_encoder_set_bytes(enc, &args, sizeof(args), 0);
+
+                const int n_rows = args.n_kv_head*args.n_block*args.n_stream;
                 ggml_metal_encoder_dispatch_threadgroups(enc, n_rows, 1, 1, 1, 1, 1);
             } break;
         case GGML_OP_NSA_SELECT_BLOCKS:
@@ -1710,7 +1747,9 @@ int ggml_metal_op_nsa(ggml_metal_op_t ctx, int idx) {
                 ggml_metal_encoder_set_bytes(enc, &args, sizeof(args), 0);
 
                 const int n_rows = args.n_kv_head*args.n_token*args.n_stream;
-                ggml_metal_encoder_dispatch_threadgroups(enc, n_rows, 1, 1, 1, 1, 1);
+                const int n_group = args.n_q_head/args.n_kv_head;
+                const int n_threads = (args.n_dim == 64 && n_group > 0 && n_group <= 32 && args.n_select <= 32) ? 32 : 1;
+                ggml_metal_encoder_dispatch_threadgroups(enc, n_rows, 1, 1, n_threads, 1, 1);
             } break;
         case GGML_OP_NSA_ATTENTION:
             {
@@ -1732,7 +1771,7 @@ int ggml_metal_op_nsa(ggml_metal_op_t ctx, int idx) {
                 args.n_dim      = (int32_t) q->ne[0];
                 args.n_q_head   = (int32_t) q->ne[1];
                 args.n_kv_head  = (int32_t) k->ne[1];
-                args.n_kv       = (int32_t) k->ne[2];
+                args.n_kv       = (int32_t) mask->ne[0];
                 args.n_token    = (int32_t) q->ne[2];
                 args.n_stream   = (int32_t) q->ne[3];
                 args.n_block    = (int32_t) ks->ne[2];
@@ -1781,7 +1820,8 @@ int ggml_metal_op_nsa(ggml_metal_op_t ctx, int idx) {
                 ggml_metal_encoder_set_bytes(enc, &args, sizeof(args), 0);
 
                 const int n_rows = args.n_q_head*args.n_token*args.n_stream;
-                ggml_metal_encoder_dispatch_threadgroups(enc, n_rows, 1, 1, 1, 1, 1);
+                const int n_threads = args.n_dim == 64 ? 32 : 1;
+                ggml_metal_encoder_dispatch_threadgroups(enc, n_rows, 1, 1, n_threads, 1, 1);
             } break;
         default:
             GGML_ABORT("fatal error");

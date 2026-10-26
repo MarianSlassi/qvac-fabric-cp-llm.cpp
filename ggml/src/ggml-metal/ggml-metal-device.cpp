@@ -578,11 +578,28 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_nsa(
         case GGML_OP_NSA_BLOCK_SUMMARY:
             name = op->src[0]->type == GGML_TYPE_F16 ? "kernel_nsa_summary_f16" : "kernel_nsa_summary_f32";
             break;
-        case GGML_OP_NSA_SELECT_BLOCKS:
-            name = "kernel_nsa_select";
+        case GGML_OP_NSA_SUMMARY_STORE:
+            if (op->src[0]->ne[0] == 64) {
+                name = op->src[0]->type == GGML_TYPE_F16 ? "kernel_nsa_summary_store_tg_f16" : "kernel_nsa_summary_store_tg_f32";
+            } else {
+                name = op->src[0]->type == GGML_TYPE_F16 ? "kernel_nsa_summary_store_f16" : "kernel_nsa_summary_store_f32";
+            }
             break;
+        case GGML_OP_NSA_SELECT_BLOCKS: {
+            const int64_t n_group = op->src[0]->ne[1] / op->src[1]->ne[1];
+            if (op->src[0]->ne[0] == 64 && n_group > 0 && n_group <= 32 && op->ne[0] <= 32) {
+                name = "kernel_nsa_select_tg";
+            } else {
+                name = "kernel_nsa_select";
+            }
+            break;
+        }
         case GGML_OP_NSA_ATTENTION:
-            name = op->src[1]->type == GGML_TYPE_F16 ? "kernel_nsa_attention_f16" : "kernel_nsa_attention_f32";
+            if (op->src[0]->ne[0] == 64) {
+                name = op->src[1]->type == GGML_TYPE_F16 ? "kernel_nsa_attention_tg_f16" : "kernel_nsa_attention_tg_f32";
+            } else {
+                name = op->src[1]->type == GGML_TYPE_F16 ? "kernel_nsa_attention_f16" : "kernel_nsa_attention_f32";
+            }
             break;
         default:
             GGML_ABORT("fatal error");

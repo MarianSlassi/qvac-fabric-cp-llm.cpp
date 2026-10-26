@@ -13372,7 +13372,7 @@ void ggml_compute_forward_nsa_block_summary(
     const int64_t n_rows = n_head*n_block*n_stream;
     const int64_t dr = (n_rows + params->nth - 1)/params->nth;
     const int64_t ir0 = dr*params->ith;
-    const int64_t ir1 = MIN(ir0 + dr, n_rows);
+    const int64_t ir1 = std::min<int64_t>(ir0 + dr, n_rows);
 
     for (int64_t ir = ir0; ir < ir1; ++ir) {
         const int64_t ib = ir % n_block;
@@ -13387,6 +13387,55 @@ void ggml_compute_forward_nsa_block_summary(
                 to_float(in, row.data(), n_dim);
             } else {
                 memcpy(row.data(), in, n_dim*sizeof(float));
+            }
+            ggml_vec_acc_f32(n_dim, out, row.data());
+        }
+        ggml_vec_scale_f32(n_dim, out, 1.0f/block_size);
+    }
+}
+
+void ggml_compute_forward_nsa_summary_store(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * src  = dst->src[0];
+    const ggml_tensor * summ = dst->src[1];
+    const ggml_tensor * range = dst->src[2];
+    const ggml_to_float_t to_float = ggml_get_type_traits(src->type)->to_float;
+    GGML_ASSERT((src->type == GGML_TYPE_F32 || to_float) && summ->type == GGML_TYPE_F32);
+    GGML_ASSERT(range->type == GGML_TYPE_I32);
+
+    const int32_t block_size = ggml_get_op_params_i32(dst, 0);
+    const int64_t n_dim    = src->ne[0];
+    const int64_t n_head   = src->ne[1];
+    const int64_t n_kv     = src->ne[2];
+    const int64_t n_stream = src->ne[3];
+    const int64_t n_block  = summ->ne[2];
+
+    const int32_t * r = (const int32_t *) range->data;
+    const int64_t ib0 = std::max<int64_t>(0, r[0]);
+    const int64_t ib1 = std::min<int64_t>(std::min<int64_t>(n_block, r[1]), n_kv/block_size);
+    if (ib1 <= ib0) {
+        return;
+    }
+
+    const int64_t n_rows = n_head*(ib1 - ib0)*n_stream;
+    const int64_t dr = (n_rows + params->nth - 1)/params->nth;
+    const int64_t ir0 = dr*params->ith;
+    const int64_t ir1 = std::min<int64_t>(ir0 + dr, n_rows);
+
+    std::vector<float> row(n_dim);
+    for (int64_t ir = ir0; ir < ir1; ++ir) {
+        const int64_t ib = ib0 + ir % (ib1 - ib0);
+        const int64_t ih = (ir/(ib1 - ib0)) % n_head;
+        const int64_t is = ir/((ib1 - ib0)*n_head);
+        float * out = (float *) ((char *) dst->data + ih*dst->nb[1] + ib*dst->nb[2] + is*dst->nb[3]);
+        ggml_vec_set_f32(n_dim, out, 0.0f);
+        for (int32_t j = 0; j < block_size; ++j) {
+            const void * p = (const void *) ((const char *) src->data + ih*src->nb[1] + (ib*block_size + j)*src->nb[2] + is*src->nb[3]);
+            if (to_float) {
+                to_float(p, row.data(), n_dim);
+            } else {
+                memcpy(row.data(), p, n_dim*sizeof(float));
             }
             ggml_vec_acc_f32(n_dim, out, row.data());
         }
@@ -13526,7 +13575,7 @@ void ggml_compute_forward_nsa_attention(
     const int64_t n_dim = q->ne[0];
     const int64_t n_q_head = q->ne[1];
     const int64_t n_kv_head = k->ne[1];
-    const int64_t n_kv = k->ne[2];
+    const int64_t n_kv = mask->ne[0];
     const int64_t n_token = q->ne[2];
     const int64_t n_stream = q->ne[3];
     const int64_t n_select = indices->ne[0];

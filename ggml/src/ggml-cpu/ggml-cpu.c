@@ -2186,6 +2186,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_nsa_block_summary(params, tensor);
             } break;
+        case GGML_OP_NSA_SUMMARY_STORE:
+            {
+                ggml_compute_forward_nsa_summary_store(params, tensor);
+            } break;
         case GGML_OP_NSA_SELECT_BLOCKS:
             {
                 ggml_compute_forward_nsa_select_blocks(params, tensor);
@@ -2551,6 +2555,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_SSM_SCAN:
         case GGML_OP_LIGHTNING_INDEXER:
         case GGML_OP_NSA_BLOCK_SUMMARY:
+        case GGML_OP_NSA_SUMMARY_STORE:
         case GGML_OP_NSA_SELECT_BLOCKS:
         case GGML_OP_NSA_ATTENTION:
             {

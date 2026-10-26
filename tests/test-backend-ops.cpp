@@ -9316,6 +9316,79 @@ struct test_diag : public test_case {
     }
 };
 
+// GGML_OP_NSA_BLOCK_SUMMARY
+struct test_nsa_block_summary : public test_case {
+    const int64_t n_kv;
+    const int64_t nkv;
+    const int64_t bs;
+
+    std::string vars() override {
+        return VARS_TO_STR3(n_kv, nkv, bs);
+    }
+
+    double max_nmse_err() override {
+        return 1e-5;
+    }
+
+    test_nsa_block_summary(int64_t n_kv = 128, int64_t nkv = 2, int64_t bs = 64)
+        : n_kv(n_kv), nkv(nkv), bs(bs) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 64, nkv, n_kv, 1);
+        ggml_set_param(k);
+        ggml_set_name(k, "k");
+        ggml_tensor * out = ggml_nsa_block_summary(ctx, k, (int) bs);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+// GGML_OP_NSA_ATTENTION with its selection step
+struct test_nsa_attention : public test_case {
+    const int64_t nh;
+    const int64_t nkv;
+    const int64_t n_token;
+    const int64_t n_seq;
+    const int64_t bs;
+    const int64_t topk;
+
+    std::string vars() override {
+        return VARS_TO_STR6(nh, nkv, n_token, n_seq, bs, topk);
+    }
+
+    double max_nmse_err() override {
+        return 1e-5;
+    }
+
+    test_nsa_attention(int64_t nh = 32, int64_t nkv = 2, int64_t n_token = 4, int64_t n_seq = 1, int64_t bs = 64, int64_t topk = 2)
+        : nh(nh), nkv(nkv), n_token(n_token), n_seq(n_seq), bs(bs), topk(topk) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t n_kv = ((n_token + bs - 1)/bs)*bs;
+
+        ggml_tensor * q  = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 64, nh, n_token, n_seq);
+        ggml_tensor * k  = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 64, nkv, n_kv, n_seq);
+        ggml_tensor * v  = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 64, nkv, n_kv, n_seq);
+        ggml_tensor * ks = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 64, nkv, n_kv/bs, n_seq);
+        ggml_tensor * vs = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 64, nkv, n_kv/bs, n_seq);
+        ggml_tensor * m  = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, n_kv, n_token, 1, n_seq);
+        for (auto * t : {q, k, v, ks, vs, m}) {
+            ggml_set_param(t);
+        }
+        ggml_set_name(q, "q");
+        ggml_set_name(k, "k");
+        ggml_set_name(v, "v");
+        ggml_set_name(ks, "ks");
+        ggml_set_name(vs, "vs");
+        ggml_set_name(m, "m");
+
+        ggml_tensor * selected = ggml_nsa_select_blocks(ctx, q, ks, m, (int) bs, (int) topk);
+        ggml_tensor * out = ggml_nsa_attention(ctx, q, k, v, ks, vs, selected, m, (int) bs, 8);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 // GGML_OP_LIGHTNING_INDEXER
 struct test_lightning_indexer : public test_case {
     const int64_t hsk; // indexer K head size
@@ -12327,6 +12400,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_lightning_indexer(128, 64, kv, 32, 4, 1, type_K));
         }
     }
+
+    // native sparse attention
+    test_cases.emplace_back(new test_nsa_block_summary(128, 2, 64));
+    test_cases.emplace_back(new test_nsa_block_summary(256, 2, 64));
+    test_cases.emplace_back(new test_nsa_attention(32, 2, 4, 1, 64, 2));
+    test_cases.emplace_back(new test_nsa_attention(32, 2, 64, 1, 64, 16));
+    test_cases.emplace_back(new test_nsa_attention(32, 2, 4, 2, 64, 2));
 
     for (ggml_type type : {GGML_TYPE_MXFP4, GGML_TYPE_NVFP4}) {
         test_cases.emplace_back(new test_repacked_mul_mat(type, 256, 1, 512));

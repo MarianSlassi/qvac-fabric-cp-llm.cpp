@@ -1155,6 +1155,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GATED_DELTA_NET_BACK",
     "LIGHTNING_INDEXER",
     "NSA_BLOCK_SUMMARY",
+    "NSA_SUMMARY_STORE",
     "NSA_SELECT_BLOCKS",
     "NSA_ATTENTION",
     "DSV4_HC_COMB",
@@ -1179,7 +1180,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 116, "GGML_OP_COUNT != 116");
+static_assert(GGML_OP_COUNT == 117, "GGML_OP_COUNT != 117");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1306,7 +1307,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 116, "GGML_OP_COUNT != 116");
+static_assert(GGML_OP_COUNT == 117, "GGML_OP_COUNT != 117");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6756,6 +6757,26 @@ struct ggml_tensor * ggml_nsa_block_summary(
     return result;
 }
 
+struct ggml_tensor * ggml_nsa_summary_store(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * k_summary,
+        struct ggml_tensor  * range,
+        int32_t               block_size) {
+    GGML_ASSERT(block_size > 0);
+    GGML_ASSERT(k->ne[0] == k_summary->ne[0] && k->ne[1] == k_summary->ne[1]);
+    GGML_ASSERT(k->ne[3] == k_summary->ne[3]);
+    GGML_ASSERT(range->type == GGML_TYPE_I32 && range->ne[0] == 2);
+
+    struct ggml_tensor * result = ggml_view_tensor(ctx, k_summary);
+    result->op     = GGML_OP_NSA_SUMMARY_STORE;
+    result->src[0] = k;
+    result->src[1] = k_summary;
+    result->src[2] = range;
+    ggml_set_op_params_i32(result, 0, block_size);
+    return result;
+}
+
 struct ggml_tensor * ggml_nsa_select_blocks(
         struct ggml_context * ctx,
         struct ggml_tensor  * q,
@@ -6767,7 +6788,7 @@ struct ggml_tensor * ggml_nsa_select_blocks(
     GGML_ASSERT(q->ne[0] == k_summary->ne[0]);
     GGML_ASSERT(q->ne[3] == k_summary->ne[3]);
     GGML_ASSERT(q->ne[1] % k_summary->ne[1] == 0);
-    GGML_ASSERT(mask->ne[0] >= k_summary->ne[2]*block_size);
+    GGML_ASSERT(mask->ne[0] > 0);
     GGML_ASSERT(mask->ne[1] == q->ne[2] && mask->ne[3] == q->ne[3]);
 
     int64_t ne[4] = { n_select, k_summary->ne[1], q->ne[2], q->ne[3] };
@@ -6799,7 +6820,7 @@ struct ggml_tensor * ggml_nsa_attention(
     GGML_ASSERT(k_summary->ne[0] == k->ne[0] && k_summary->ne[1] == k->ne[1]);
     GGML_ASSERT(v_summary->ne[0] == v->ne[0] && v_summary->ne[1] == v->ne[1]);
     GGML_ASSERT(k_summary->ne[2] == v_summary->ne[2]);
-    GGML_ASSERT(mask->ne[0] == k->ne[2] && mask->ne[1] == q->ne[2] && mask->ne[3] == q->ne[3]);
+    GGML_ASSERT(mask->ne[0] <= k->ne[2] && mask->ne[1] == q->ne[2] && mask->ne[3] == q->ne[3]);
 
     struct ggml_tensor * result = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, q->ne[0], q->ne[1], 3*q->ne[2], q->ne[3]);
     result->op = GGML_OP_NSA_ATTENTION;

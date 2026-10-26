@@ -131,6 +131,9 @@ int main() {
     ggml_backend_load_all();
     ggml_backend_dev_t cpu  = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
     ggml_backend_dev_t gpu  = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU);
+    if (!gpu) {
+        gpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_IGPU);
+    }
 
     const result r_cpu = run(c, cpu);
 
@@ -225,7 +228,7 @@ int main() {
         const double d_gpu = compare(r_gpu, ggml_backend_dev_name(gpu));
         if (d_gpu > 1e-4) fails++;
     } else {
-        printf("no GPU backend, metal check skipped\n");
+        printf("no GPU backend, GPU check skipped\n");
     }
 
     printf("selection checks: %d, fails: %d\n", checks, fails);
