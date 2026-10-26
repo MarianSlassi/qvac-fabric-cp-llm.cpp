@@ -41,6 +41,9 @@ NSA_TEST_MODEL="$MODEL" "$BUILD/bin/test-nsa-model" /tmp/nsa_cpu.bin
 echo "== model, Metal =="
 NSA_TEST_GPU_LAYERS=99 NSA_TEST_MODEL="$MODEL" "$BUILD/bin/test-nsa-model" /tmp/nsa_gpu.bin
 
+echo "== model, Metal, Q8_0 KV =="
+NSA_TEST_GPU_LAYERS=99 NSA_TEST_KV_Q8=1 NSA_TEST_MODEL="$MODEL" "$BUILD/bin/test-nsa-model" /tmp/nsa_gpu_q8kv.bin
+
 if [[ -n "${NSA_VULKAN_BUILD:-}" ]]; then
     echo "== operators, Vulkan =="
     "$NSA_VULKAN_BUILD/bin/test-nsa-ops"
@@ -59,6 +62,12 @@ uv run --project "$ROOT" python "$ROOT/tests/nsa_reference.py" \
     --model "$MODEL_DIR" \
     --prompt "The capital of France is Paris. It is known for the Eiffel Tower and the Louvre museum." \
     --compare /tmp/nsa_cpu.bin
+
+echo "== PyTorch reference, Metal Q8_0 KV =="
+uv run --project "$ROOT" python "$ROOT/tests/nsa_reference.py" \
+    --model "$MODEL_DIR" \
+    --prompt "The capital of France is Paris. It is known for the Eiffel Tower and the Louvre museum." \
+    --compare /tmp/nsa_gpu_q8kv.bin
 
 echo "== sample output, CPU =="
 "$BUILD/bin/llama-completion" -m "$MODEL" -p "The capital of France is" -n 16 -c 256 --simple-io 2>/dev/null | tail -2

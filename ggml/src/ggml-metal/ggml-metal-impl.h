@@ -1503,6 +1503,7 @@ typedef struct {
     int32_t  local_size;
     int32_t  mask_ne3;
     int32_t  mask_f16;
+    int32_t  kv_q8;
     uint64_t nb_q1, nb_q2, nb_q3;
     uint64_t nb_k1, nb_k2, nb_k3;
     uint64_t nb_v1, nb_v2, nb_v3;

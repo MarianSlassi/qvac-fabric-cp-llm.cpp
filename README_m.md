@@ -1,18 +1,38 @@
 # Gated DeltaNet + NSA in qvac-fabric-llm.cpp
 
 Native ggml/GGUF support for `Idiap/gated-deltanet-nsa-0.4B-10B`.
-Inference is plain C++; Python is only used for conversion and for the reference
-check.
+The implementation includes conversion of Hugging Face (HF) checkpoints to
+GGUF, loading of GGUF files, CPU and GPU inference, prompt processing,
+token-by-token generation, validation and automated tests. Inference uses C++
+only. Python is used for conversion and for the reference check. The K/V cache
+holds attention keys and values; q8_0 stores them in 8-bit blocks. f32 and f16
+are 32-bit and 16-bit floating-point formats.
 
-## What was added
+GGUF is the model file format used by llama.cpp, and ggml is its C inference
+library. Metal is Apple's GPU API; Vulkan is a cross-platform GPU API.
 
-- `conversion/hybrid_gated_deltanet.py` - HF to GGUF converter.
+## Overview
+
+| Area | Implementation |
+|---|---|
+| Native inference | HF checkpoint to GGUF; C++/ggml graph; Python only for conversion and reference |
+| CPU | Full model; f32, f16 and q8_0 weights; f16 and q8_0 KV cache |
+| GPU | Metal (main): f32, f16 and q8_0 K/V. Vulkan (second): f32 K/V |
+| Generation | Prompt processing and token-by-token decoding |
+| Validation | Operation and backend tests, end-to-end tests, and a PyTorch reference |
+| Quantization | f16 and q8_0 weights; q8_0 KV cache on CPU and Metal |
+
+## Implemented components
+
+The implementation has these parts:
+
+- `conversion/hybrid_gated_deltanet.py` - Hugging Face to GGUF converter.
 - `src/models/hybrid-gated-deltanet.cpp` - model load and graph.
-- `src/llama-arch.*`, `src/llama-model.cpp`, `src/llama-context.cpp` - arch
-  registration and hybrid memory wiring.
-- `src/llama-memory-nsa-summary.*` - per-layer block-summary buffer.
-- `src/llama-memory-hybrid-nsa.*` - hybrid memory with the summary buffer.
-- Four new ggml ops:
+- `src/llama-arch.*`, `src/llama-model.cpp`, `src/llama-context.cpp` - model
+  registration and hybrid memory setup.
+- `src/llama-memory-nsa-summary.*` - one block-summary buffer per layer.
+- `src/llama-memory-hybrid-nsa.*` - hybrid memory that uses the summary buffer.
+- Four ggml operations:
   - `NSA_BLOCK_SUMMARY`
   - `NSA_SUMMARY_STORE`
   - `NSA_SELECT_BLOCKS`
@@ -26,84 +46,83 @@ check.
 - `NSA_ATTENTION` and `NSA_BLOCK_SUMMARY` cases in
   `tests/test-backend-ops.cpp`.
 
-## Status
-
-Done:
-
-- HF checkpoint to GGUF conversion.
-- GGUF load and native C++ inference.
-- CPU output.
-- Metal output. Metal is the main GPU path.
-- Vulkan output. Vulkan is an additional backend and needs f32 K/V.
-- Incremental NSA block-summary cache.
-- Q8_0 quantized weights.
-- F16 weights tested on CPU and Metal.
-- Targeted operator and end-to-end tests, plus a PyTorch reference check.
-
-Not done:
-
-- CUDA and mobile.
-- F16 Vulkan shaders. The Vulkan path currently needs f32 K/V and `-fa off`.
-- Multi-sequence/batched prompt processing.
-- Context rollback/shifting. The code rejects these operations explicitly.
-- Full `ctest` and `test-llama-archs` for this architecture.
-- Official `fla` comparison on CUDA.
-
 ## Model
 
-- 24 layers: even layers are Gated DeltaNet, odd layers are NSA.
+- 24 layers: even layers are Gated DeltaNet (GDN), odd layers are sparse
+  attention (NSA).
 - 12 GDN + 12 NSA.
-- 32 q heads, 2 KV heads, head dim 64 for NSA.
-- 8 GDN heads, head dim 128 for GDN.
-- block size 64, top-k 16, local window 512.
-- 358M params, 1.33 GiB in f32, context 4096.
-- Base LM, not instruct/chat. Completion is the intended mode.
+- 32 query heads, 2 key/value heads, head size 64 for NSA.
+- 8 GDN heads, head size 128 for GDN.
+- block size 64, top-k 16 (the selector keeps the best 16 blocks), local window
+  512.
+- 358M parameters, 1.33 GiB in f32, context 4096.
+- Base language model, not a chat model. Completion is the intended mode.
 
 
-## Implementation Validation
+## Validation methodology and results
 
-Official `fla` (flash-linear-attention) needs Triton and a CUDA GPU. (Current host was Mac)
-`tests/nsa_reference.py` is a slow PyTorch port of the fla math:
+The official `fla` (flash-linear-attention) implementation needs Triton and a
+CUDA GPU. This work was done on macOS, where those kernels cannot run.
+`tests/nsa_reference.py` is a slow PyTorch version of the same math:
 
-- GDN recurrence;
-- RoPE with split-half layout;
+- GDN (Gated DeltaNet) recurrence;
+- RoPE (rotary position encoding) with split-half layout;
 - mean-pooled compressed K/V;
-- block selection with lse and forced first/current/previous blocks;
-- selected attention with causal mask;
+- block selection with log-sum-exp (lse) and forced first/current/previous
+  blocks;
+- selected attention with a mask that blocks future tokens;
 - sliding window;
 - sigmoid gates.
 
+The Python version runs separately from the C++ code. It reads the same
+Hugging Face checkpoint and produces logits for the same prompt. The C++ test
+writes logits for every token. The Python script compares all logits and the
+top-1 token. This checks the model math and graph, not just the generated text.
+
 Measured results:
+
+`top-1` is the highest-scoring next token. `max` and `mean` are the largest and
+average differences in the output scores (logits); `max abs diff` is the largest
+absolute difference.
 
 | Check | Result |
 |---|---|
-| GDN op, 1..512 tokens | max abs diff 4.1e-10 vs naive recurrence |
-| NSA ops, 128 tokens, CPU | max abs diff 2.1e-7 |
-| NSA ops, 128 tokens, Metal | max abs diff 2.4e-7 |
-| NSA ops, 128 tokens, Vulkan | max abs diff 2.4e-7 |
+| GDN operation, 1..512 tokens | max abs diff 4.1e-10 vs simple recurrence |
+| NSA operations, 128 tokens, CPU | max abs diff 2.1e-7 |
+| NSA operations, 128 tokens, Metal | max abs diff 2.4e-7 |
+| NSA operations, 128 tokens, Vulkan | max abs diff 2.4e-7 |
 | Model vs reference, 23 tokens, CPU | max 0.00166, mean 0.00016, top-1 23/23 |
 | Model vs reference, 98 tokens, CPU | max 0.00496, mean 0.00023, top-1 98/98 |
 | Model vs reference, 23 tokens, Metal | max 0.0101, mean 0.00080, top-1 23/23 |
 | Model vs reference, 23 tokens, Vulkan | max 0.00804, mean 0.00077, top-1 23/23 |
-| Prefill vs decode, CPU 23/98/512 | max 9.8e-4 / 1.4e-3 / 1.4e-3, top-1 0 |
-| Prefill vs decode, Metal 23/98/512 | max 0.0095 / 0.0091 / 0.0127, top-1 0 |
-| Prefill vs decode, Vulkan 23/98 | max 0.0080 / 0.0094, top-1 0/23 and 1/98 |
+| Model vs reference, 23 tokens, CPU, F16 weights | max 0.0691, mean 0.00547, top-1 23/23 |
+| Model vs reference, 23 tokens, CPU, Q8_0 weights | max 0.326, mean 0.0214, top-1 23/23 |
+| Model vs reference, 23 tokens, CPU, Q8_0 KV | max 0.0483, mean 0.00417, top-1 23/23 |
+| Model vs reference, 23 tokens, Metal, Q8_0 KV | max 0.0408, mean 0.00419, top-1 23/23 |
+| Prompt vs generation, CPU 23/98/512 | max 9.8e-4 / 1.4e-3 / 1.4e-3, top-1 0 |
+| Prompt vs generation, CPU Q8_0 KV 23/512 | max 0.0082 / 0.0255, top-1 0 |
+| Prompt vs generation, Metal 23/98/512 | max 0.0088 / 0.0088 / 0.0129, top-1 0 |
+| Prompt vs generation, Metal Q8_0 KV 23/98/512 | max 0.0321 / 0.0321 / 0.0399, top-1 0 |
+| Prompt vs generation, Vulkan 23/98 | max 0.0080 / 0.0094, top-1 0/23 and 1/98 |
 
 Tolerances:
 
-- operator tests: 1e-5 on CPU, 1e-4 on GPU;
-- model: top-1 must match; CPU max logit diff should stay under 0.005 for
-  short contexts; GPU under 0.01;
-- GPU prefill/decode allows one top-1 mismatch in long runs. CPU is strict.
+- operation tests: 1e-5 on CPU, 1e-4 on GPU;
+- model: top-1 must match. With f32 weights, the largest CPU logit difference
+  should stay below 0.005 for short contexts, and below 0.01 on GPU;
+- tests with F16/Q8_0 weights or Q8_0 KV use a larger limit of 0.1 for the
+  largest logit difference. Top-1 still must match; GPU long runs allow one
+  mismatch, CPU allows none.
 
-The remaining differences are f32/f16 rounding and different backend
-accumulation order. They are not exact bitwise checks.
+Differences come from f32/f16 rounding and from different summation order on
+each backend. The checks compare numbers and top-1 tokens; identical bits are
+not expected.
 
 ## Performance
 
 Apple M4, 6 CPU threads. f32, f16 and q8_0 weights.
 
-Short context (`pp128`, `tg32`):
+Short context: 128-token prompt (`pp128`), 32 generated tokens (`tg32`).
 
 | backend | pp128 | tg32 |
 |---|---:|---:|
@@ -114,6 +133,8 @@ Short context (`pp128`, `tg32`):
 | Metal f16 | 2182 t/s | 98.5 t/s |
 | CPU q8_0 | 534 t/s | 74.8 t/s |
 | Metal q8_0 | 1937 t/s | 95.2 t/s |
+| CPU f16 + Q8_0 KV | 553 t/s | 89.7 t/s |
+| Metal f16 + Q8_0 KV | 2034 t/s | 97.2 t/s |
 
 Long context (98-token prompt, 4096 context):
 
@@ -122,77 +143,119 @@ Long context (98-token prompt, 4096 context):
 | Metal | 1362 t/s | 43.6 t/s |
 | Vulkan | 153 t/s | 17.0 t/s |
 
-Memory: about 1.5 GB RSS for the f32 model plus runtime. The summary cache is
-small (about 0.8 MB for 12 NSA layers at 4096 context). F16 weights are 685 MiB
-and Q8_0 is 364 MiB; both produce coherent output on CPU and Metal. The lower
-bit width reduces the weight read per generated token, which is why decode gets
-faster.
+Memory: about 1.5 GB of RAM for the f32 model plus runtime. The summary cache is
+small: about 0.8 MB for 12 NSA layers at 4096 context. F16 weights use 685 MiB,
+and Q8_0 weights use 364 MiB. Both give coherent output on CPU and Metal. The
+smaller weights reduce the data read for each generated token, which makes
+decode faster.
 
 Metal is much faster than CPU for prompt processing. Decode is close to CPU
-because it is memory-bound and the model is small. Vulkan via MoltenVK is the
-slowest path and is mainly a correctness target.
+because it is memory-bound and the model is small. Vulkan through MoltenVK is
+the slowest path. It is used to check that the code works on another GPU API and
+to compare results.
 
-## Implementation notes
+## Design and implementation notes
 
-- `src/models/hybrid-gated-deltanet.cpp` derives shapes from hparams. The only
-  fixed values left are validation checks in `load_arch_hparams` so another
-  checkpoint is rejected instead of loaded with wrong shapes.
-- GDN reuses `build_delta_net_fused` and the existing
-  `GGML_OP_GATED_DELTA_NET`; the GDN kernel itself was not changed.
-- Metal attention and summary-store use 32-lane threadgroups. Selection uses a
-  32-lane threadgroup when there are at least 32 blocks; short contexts use the
-  scalar path because the top-k merge overhead is higher there.
-- Vulkan uses the same selection threshold.
-- The tokenizer uses a sentencepiece-style BPE. The converter writes
-  `tokenizer.ggml.add_space_prefix=true`, and the BPE path in
-  `src/llama-vocab.cpp` now applies it. Token IDs match the HF
-  `LlamaTokenizer` on the strings I tested, including English, contractions,
-  numbers and Cyrillic.
-- The model is a base LM. There is no chat template and none is needed for
-  completion. An instruct checkpoint would need its own template.
-- Summary cache stores mean K/V per completed 64-token block. `NSA_SUMMARY_STORE`
-  takes the block range from `nsa_range` and writes only new blocks, so the
-  context is not re-pooled on every graph. The buffer is append-only; rollback
-  and shifting are not supported.
+- The graph gets its tensor shapes from the model parameters.
+  `load_arch_hparams` checks the expected values. An incompatible checkpoint
+  stops with an error at load time; it does not build a graph with wrong
+  dimensions.
+- GDN uses `build_delta_net_fused` and `GGML_OP_GATED_DELTA_NET`. The existing
+  GDN kernel is used without changes.
+- The four NSA operations create block summaries, store new summaries, select
+  blocks, and run selected and sliding-window attention. CPU, Metal and Vulkan
+  each provide the needed kernels or shaders.
+- The summary cache stores the mean K and V values for each completed 64-token
+  block. `NSA_SUMMARY_STORE` reads `nsa_range` and writes only new blocks.
+  Completed blocks are not pooled again on every graph. The buffer is saved and
+  loaded with the context state.
+- Metal attention and summary-store use groups of 32 GPU threads. Selection
+  also uses a 32-thread group when there are at least 32 blocks. Each thread
+  scans part of the blocks and keeps its own short list of the best block
+  scores. Thread 0 then merges the 32 lists. With fewer than 32 blocks (under
+  2048 tokens at block size 64), most threads are idle. The writes to shared GPU
+  memory, the synchronization point and the final merge then cost more than one
+  single-thread loop. Those cases use the single-thread path. Vulkan uses the
+  same threshold.
+- Metal q8_0 K/V is converted back to float inside the NSA kernels. Each row is
+  read as q8_0 blocks and converted before the dot product or sum. This keeps
+  the cache small and avoids a separate pass over the whole cache. CPU uses the
+  ggml type traits for the same conversion; Vulkan uses f32 K/V.
+- The tokenizer is a byte-pair encoding (BPE) tokenizer based on sentencepiece.
+  The converter writes `tokenizer.ggml.add_space_prefix=true`, and the BPE code
+  in `src/llama-vocab.cpp` uses it. Token IDs match the HF `LlamaTokenizer` on
+  the tested strings, including English, contractions, numbers and Cyrillic.
+- The model is a base language model for completion; it has no chat template.
+  An instruct checkpoint would need its own chat template.
 
-## Known limitations
+## Status
 
-- Vulkan NSA shaders are f32 only. Default f16 KV cache needs `-ctk f32
-  -ctv f32 -fa off`.
-- Metal supports f16/f32 K/V but not quantized KV cache. The CPU path can read
-  quantized K/V.
-- Selection uses a threadgroup only for long contexts; the short path is
-  scalar. The threshold is a tuning point.
-- Multi-sequence/batched prompt processing is not supported. The NSA graph
-  asserts `n_seqs == 1`.
-- Summary state is append-only. `seq_rm` returns false; `seq_cp`, `seq_keep`,
-  `seq_add` and `seq_div` abort with a clear message. Context shifting and
-  rollback are not supported.
-- Full `ctest` and `test-llama-archs` for the new architecture were not run.
-- The reference is a PyTorch port, not the official Triton `fla` kernels.
-- No CUDA and no mobile support.
-- Quantized KV cache works on CPU in the current kernels. Metal and Vulkan
-  still need dequantization support in the NSA K/V kernels.
+Done:
 
-## Short assessment
+- Hugging Face checkpoint to GGUF conversion.
+- GGUF loading and native C++ inference.
+- CPU inference with f32, f16 and q8_0 weights.
+- Metal inference. Metal is the main GPU path; it supports f32, f16 and q8_0
+  K/V.
+- Vulkan inference. Vulkan is the second GPU path; it supports f32 K/V.
+- Summary cache for NSA blocks; the state can be saved and loaded.
+- f16 and q8_0 weights tested on CPU and Metal.
+- q8_0 KV cache on CPU and Metal.
+- Operation tests, backend tests, end-to-end tests, tokenizer checks and
+  reference checks.
 
-The required path works: conversion, loading, CPU inference, Metal inference,
-Vulkan inference, incremental summaries, Q8_0, operator tests, model
-prefill/decode tests and a reference comparison. The new ops pass the project
-`test-backend-ops` cases on Metal and Vulkan.
+Not done:
 
-The weakest parts are the f32-only Vulkan shaders, the scalar short-context
-selection path, the missing multi-sequence/rollback coverage and the lack of an
-official `fla` comparison on CUDA. The model is a base LM, so completion is the
-intended mode.
+- CUDA and mobile: this work does not include them. The work was done on macOS,
+  which has no CUDA device, and the model is a desktop/server target. Metal is
+  the main GPU path.
+- F16 and q8_0 K/V on Vulkan: Vulkan supports f32 K/V only. Metal already covers
+  the f16 and q8_0 GPU paths. The f32 Vulkan path is enough to check that the
+  code works on another GPU API and to compare results. Adding f16 or q8_0
+  would need more shader versions and an f16 mask path.
+- Q4/Q5 KV cache on Metal: Metal supports Q8_0 K/V. Q4 and Q5 would need more
+  conversion code in the Metal kernels. CPU can read them through the ggml type
+  traits.
+- Multi-sequence and batched prompt processing: the model runs one sequence at
+  a time. Its summary cache belongs to one sequence and only adds new blocks.
+  Several sequences would need separate summary state and synchronization. The
+  graph checks `n_seqs == 1` and stops with a clear error for other values.
+- Context rollback and shifting: the summary cache keeps completed blocks and
+  only adds new ones. Rollback would need a way to remove or mark old summary
+  entries invalid. `seq_rm` returns false; `seq_cp`, `seq_keep`, `seq_add` and
+  `seq_div` stop with a clear message.
+- Full `ctest` and `test-llama-archs`: the targeted tests cover the
+  model-specific code. The full suite is much larger and includes many
+  unrelated targets; the tests used here can be rerun with
+  `tests/run-nsa-checks.sh`.
+- Official `fla` comparison: the official kernels need Triton and a CUDA GPU.
+  This work was done on macOS, where they cannot run. The PyTorch version uses
+  the same math and gives an independent check.
 
-## What I would do next
+## Summary
 
-1. Add f16 Vulkan shaders so the default cache works without `-fa off`.
-2. Tune the selection threadgroup threshold and optimize the scalar short path.
-3. Add the architecture to `test-llama-archs` and run a full `ctest`.
-4. Test multi-sequence, state rollback and context shifting.
-5. Add CUDA and run the official `fla` comparison there, if that is in scope.
+The implementation provides a complete native path: Hugging Face to GGUF
+conversion, GGUF loading, CPU inference, Metal inference, Vulkan inference, a
+summary cache for NSA blocks, f16/q8_0 weights, q8_0 KV on CPU and Metal, prompt
+processing, token-by-token generation, operation tests, prompt and generation
+tests and a PyTorch reference comparison. The NSA operations pass the project
+`test-backend-ops` cases on Metal and Vulkan. The main CPU and Metal paths are
+complete. Vulkan adds a second GPU path with f32 K/V. The model is a base
+language model; completion is the intended mode.
+
+## Possible extensions
+
+Optional extensions:
+
+1. Add f16 and q8_0 K/V support to Vulkan to make the second GPU path more
+   complete.
+2. Tune the selection threshold and speed up the single-thread short-context
+   path.
+3. Add support for several sequences, rollback and context shifting for server
+   use.
+4. Add the model to `test-llama-archs` and run the full `ctest`.
+5. Add CUDA support and run the official `fla` comparison when CUDA hardware is
+   available.
 
 ## Build
 
@@ -209,12 +272,13 @@ cmake -S . -B build \
 cmake --build build --target llama-completion -j
 ```
 
-Use `--target llama-completion` for a run build. Do not use plain
-`cmake --build build -j` with tests enabled in this tree: the generic
-`test-chat` target needs the `tools/mtmd` include path when
-`LLAMA_BUILD_SERVER=OFF`, and `all` stops before linking the tools.
+Build only `llama-completion` for a run build. A normal
+`cmake --build build -j` also builds the test targets. If tests are enabled,
+`test-chat` needs the `tools/mtmd` include path when
+`LLAMA_BUILD_SERVER=OFF`; the `all` target can then stop before linking the
+tools.
 
-Vulkan (macOS uses MoltenVK):
+Vulkan on macOS uses MoltenVK:
 
 ```bash
 brew install molten-vk vulkan-headers vulkan-loader shaderc glslang vulkan-tools
@@ -227,10 +291,10 @@ cmake -S . -B build-vk \
 cmake --build build-vk --target llama-completion -j 8
 ```
 
-Note: The first Vulkan build is slow: most of the time is one large translation unit,
-`ggml-vulkan.cpp`, plus shader generation. It prints nothing while clang is
-compiling that file, so it can look stuck. Check CPU/Activity Monitor; expect
-couple of minutes (3-7 minutes) on an M-series Mac. Do not interrupt it.
+The first Vulkan build takes a few minutes. Most of the time is spent compiling
+one large file, `ggml-vulkan.cpp`, and generating shaders. The build prints
+nothing during this step and can look stuck. Check CPU/Activity Monitor; expect
+3-7 minutes on an M-series Mac. The build is safe to leave running.
 
 ## Convert
 
@@ -241,8 +305,21 @@ uv run --project . python convert_hf_to_gguf.py \
   --outfile gated-deltanet-nsa-0.4B-10B/gated-deltanet-nsa-0.4B-10B-f32.gguf
 ```
 
-The model directory is already present and is gitignored. The GGUF is about
-1.33 GiB.
+Place the Hugging Face checkpoint in the `gated-deltanet-nsa-0.4B-10B/` directory
+(gitignored). The f32 GGUF is about 1.33 GiB.
+
+F16 and Q8_0 model files:
+
+```bash
+uv run --project . python convert_hf_to_gguf.py \
+  gated-deltanet-nsa-0.4B-10B \
+  --outtype f16 \
+  --outfile gated-deltanet-nsa-0.4B-10B/gated-deltanet-nsa-0.4B-10B-f16.gguf
+
+build/bin/llama-quantize \
+  gated-deltanet-nsa-0.4B-10B/gated-deltanet-nsa-0.4B-10B-f32.gguf \
+  gated-deltanet-nsa-0.4B-10B/gated-deltanet-nsa-0.4B-10B-q8_0.gguf Q8_0
+```
 
 ## Run
 
@@ -263,9 +340,24 @@ build/bin/llama-completion \
   -ot token_embd.weight=MTL0
 ```
 
-`-ot` puts the tiny input embedding on Metal too. Without it, llama.cpp keeps
-that `GET_ROWS` node on CPU/BLAS. This is normal llama.cpp behavior and is not a
-fallback of the NSA ops.
+`-ot` also puts the small input embedding on Metal. Without it, llama.cpp keeps
+the embedding lookup on CPU/BLAS. This is normal llama.cpp placement; the NSA
+operations still run on Metal.
+
+Q8_0 KV cache on Metal:
+
+```bash
+build/bin/llama-completion \
+  -m gated-deltanet-nsa-0.4B-10B/gated-deltanet-nsa-0.4B-10B-f16.gguf \
+  -p "The capital of France is" -n 32 -c 256 -ngl 99 \
+  -ctk q8_0 -ctv q8_0 -fa on \
+  -ot token_embd.weight=MTL0
+```
+
+llama.cpp requires `-fa on` when the V cache is quantized. The NSA kernels do
+not use flash attention. The flag also makes the mask f16, which the kernels
+support. With `-ngl 99` and `-ot`, the run puts all 25 layers on `MTL0` and
+reports `graph splits = 1`. The q8_0 KV path runs entirely on the GPU.
 
 Vulkan:
 
@@ -277,9 +369,10 @@ build-vk/bin/llama-completion \
   -ot token_embd.weight=Vulkan0
 ```
 
-The Vulkan NSA shaders are f32 K/V and f32 mask only. `-fa off` keeps the mask
-f32; `-ctk f32 -ctv f32` keeps the cache f32. With the default f16 cache these
-ops are not supported on Vulkan and the scheduler would use CPU.
+The Vulkan NSA shaders support f32 K/V and an f32 mask. `-fa off` keeps the mask
+f32; `-ctk f32 -ctv f32` keeps the cache f32. With the default f16 cache,
+Vulkan would run these operations on CPU. Use the f32 flags for a GPU-only
+Vulkan run.
 
 CPU example:
 
@@ -289,8 +382,8 @@ The capital of France is Paris. It is located in the north of the country.
 
 ## Tests
 
-If the run build above used `LLAMA_BUILD_TESTS=OFF`, reconfigure with tests on
-and build only the test targets:
+When the run build uses `LLAMA_BUILD_TESTS=OFF`, configure a test build with
+tests enabled and build only the test targets:
 
 ```bash
 cmake -S . -B build \
@@ -311,37 +404,40 @@ build/bin/test-nsa-ops
 NSA_TEST_MODEL=.../model-f32.gguf build/bin/test-nsa-model /tmp/nsa.bin
 NSA_TEST_GPU_LAYERS=99 NSA_TEST_MODEL=... build/bin/test-nsa-model /tmp/nsa_gpu.bin
 NSA_TEST_GPU_LAYERS=99 NSA_TEST_KV_F32=1 NSA_TEST_MODEL=... build/bin/test-nsa-model /tmp/nsa_gpu_f32.bin
+NSA_TEST_GPU_LAYERS=99 NSA_TEST_KV_Q8=1 NSA_TEST_MODEL=... build/bin/test-nsa-model /tmp/nsa_gpu_q8kv.bin
 build/bin/test-backend-ops -o NSA_ATTENTION
 build/bin/test-backend-ops -o NSA_BLOCK_SUMMARY
 NSA_TOKENIZE=build/bin/llama-tokenize NSA_GGUF=... NSA_MODEL_DIR=... \
   uv run --project . python tests/test-nsa-tokenizer.py
 ```
 
-`test-gdn-op` compares the Gated DeltaNet op with a naive recurrence for 1, 64,
-128, 192, 193, 256 and 512 tokens.
+`test-gdn-op` compares the Gated DeltaNet operation with a simple recurrence for
+1, 64, 128, 192, 193, 256 and 512 tokens.
 
-`test-nsa-ops` builds a 128-token causal case, checks that selection never
-picks a future block, and compares selection plus the three attention branches
-against a small C++ reference.
+`test-nsa-ops` builds a 128-token case with a mask that blocks future tokens. It
+checks that selection never picks a future block, and compares selection and the
+three attention branches with a small C++ reference.
 
 `test-nsa-model` runs the whole model and compares prompt processing with
 token-by-token generation. It skips with return code 77 when `NSA_TEST_MODEL`
 is not set.
 
-`test-backend-ops -o NSA_ATTENTION` runs the selection + attention graph on all
-backends, including a 2048-token case that exercises the threadgroup selection
-kernel. `-o NSA_BLOCK_SUMMARY` covers the pooling op.
-`test-nsa-tokenizer.py` compares the GGUF tokenizer IDs with the HF
+`test-backend-ops -o NSA_ATTENTION` runs the selection and attention graph on
+all backends. It includes a 2048-token case that uses the 32-thread selection
+kernel. The `-o NSA_BLOCK_SUMMARY` case tests the summary operation.
+`test-nsa-tokenizer.py` compares the GGUF tokenizer IDs with the Hugging Face
 `LlamaTokenizer` for English text, contractions, numbers and Cyrillic.
 
-Current results:
+Test results:
 
-- `test-gdn-op`: PASS, 1..512 tokens.
-- `test-nsa-ops`: PASS on CPU/Metal/Vulkan; summary store checks 0 diff.
-- `test-nsa-model`: PASS on CPU/Metal/Vulkan.
-- `test-backend-ops -o NSA_ATTENTION`: 4/4 on Metal and Vulkan.
-- `test-backend-ops -o NSA_BLOCK_SUMMARY`: 2/2 on Metal and Vulkan.
-- tokenizer check: PASS.
+- `test-gdn-op`: passed, 1..512 tokens.
+- `test-nsa-ops`: passed on CPU, Metal and Vulkan; the summary-store check shows
+  no difference.
+- `test-nsa-model`: passed on CPU, Metal and Vulkan; also passed with F16/Q8_0
+  weights and with Q8_0 KV on CPU and Metal (23, 98 and 512 tokens).
+- `test-backend-ops -o NSA_ATTENTION`: 4/4 passed on Metal and Vulkan.
+- `test-backend-ops -o NSA_BLOCK_SUMMARY`: 2/2 passed on Metal and Vulkan.
+- tokenizer check: passed.
 
 `tests/run-nsa-checks.sh` runs the CPU/Metal checks and the reference compare.
 Set `NSA_VULKAN_BUILD` to also run the Vulkan checks.

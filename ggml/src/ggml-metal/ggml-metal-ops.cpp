@@ -1640,7 +1640,7 @@ int ggml_metal_op_nsa(ggml_metal_op_t ctx, int idx) {
         case GGML_OP_NSA_BLOCK_SUMMARY:
             {
                 const ggml_tensor * src = op->src[0];
-                GGML_ASSERT(src->type == GGML_TYPE_F32 || src->type == GGML_TYPE_F16);
+                GGML_ASSERT(src->type == GGML_TYPE_F32 || src->type == GGML_TYPE_F16 || src->type == GGML_TYPE_Q8_0);
                 GGML_ASSERT(op->type == GGML_TYPE_F32);
 
                 args.n_dim      = (int32_t) src->ne[0];
@@ -1648,6 +1648,7 @@ int ggml_metal_op_nsa(ggml_metal_op_t ctx, int idx) {
                 args.n_block    = (int32_t) op->ne[2];
                 args.n_stream   = (int32_t) src->ne[3];
                 args.block_size = ggml_get_op_params_i32(op, 0);
+                args.kv_q8      = src->type == GGML_TYPE_Q8_0;
 
                 args.nb_k1  = src->nb[1];
                 args.nb_k2  = src->nb[2];
@@ -1672,7 +1673,7 @@ int ggml_metal_op_nsa(ggml_metal_op_t ctx, int idx) {
                 const ggml_tensor * k    = op->src[0];
                 const ggml_tensor * summ = op->src[1];
                 const ggml_tensor * range = op->src[2];
-                GGML_ASSERT((k->type == GGML_TYPE_F32 || k->type == GGML_TYPE_F16));
+                GGML_ASSERT((k->type == GGML_TYPE_F32 || k->type == GGML_TYPE_F16 || k->type == GGML_TYPE_Q8_0));
                 GGML_ASSERT(summ->type == GGML_TYPE_F32);
                 GGML_ASSERT(range->type == GGML_TYPE_I32);
                 GGML_ASSERT(op->type == GGML_TYPE_F32);
@@ -1683,6 +1684,7 @@ int ggml_metal_op_nsa(ggml_metal_op_t ctx, int idx) {
                 args.n_stream   = (int32_t) k->ne[3];
                 args.n_block    = (int32_t) summ->ne[2];
                 args.block_size = ggml_get_op_params_i32(op, 0);
+                args.kv_q8      = k->type == GGML_TYPE_Q8_0;
 
                 args.nb_k1  = k->nb[1];
                 args.nb_k2  = k->nb[2];
@@ -1762,7 +1764,7 @@ int ggml_metal_op_nsa(ggml_metal_op_t ctx, int idx) {
                 const ggml_tensor * idxs = op->src[5];
                 const ggml_tensor * mask = op->src[6];
                 GGML_ASSERT(q->type == GGML_TYPE_F32);
-                GGML_ASSERT(k->type == GGML_TYPE_F32 || k->type == GGML_TYPE_F16);
+                GGML_ASSERT(k->type == GGML_TYPE_F32 || k->type == GGML_TYPE_F16 || k->type == GGML_TYPE_Q8_0);
                 GGML_ASSERT(v->type == k->type);
                 GGML_ASSERT(ks->type == GGML_TYPE_F32 && vs->type == GGML_TYPE_F32);
                 GGML_ASSERT(idxs->type == GGML_TYPE_I32);
@@ -1779,6 +1781,7 @@ int ggml_metal_op_nsa(ggml_metal_op_t ctx, int idx) {
                 args.n_select   = (int32_t) idxs->ne[0];
                 args.block_size = ggml_get_op_params_i32(op, 0);
                 args.local_size = ggml_get_op_params_i32(op, 1);
+                args.kv_q8      = k->type == GGML_TYPE_Q8_0;
                 args.mask_ne3   = (int32_t) mask->ne[3];
                 args.mask_f16   = mask->type == GGML_TYPE_F16;
 

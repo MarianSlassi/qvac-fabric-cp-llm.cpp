@@ -14463,6 +14463,35 @@ static inline bool kernel_nsa_visible(device const char * row, int ik, uint64_t 
     return isfinite(*(device const float *) p);
 }
 
+static inline void kernel_nsa_load_q8_0(device const char * p, thread float * dst, int n_dim) {
+    device const block_q8_0 * blocks = (device const block_q8_0 *) p;
+    const int nb = n_dim/32;
+    for (int ib = 0; ib < nb; ++ib) {
+        const float d = (float) blocks[ib].d;
+        for (int i = 0; i < 32; ++i) {
+            dst[ib*32 + i] = d * (float) blocks[ib].qs[i];
+        }
+    }
+}
+
+static inline float kernel_nsa_load_q8_0_elem(device const char * p, int i) {
+    device const block_q8_0 * blocks = (device const block_q8_0 *) p;
+    const int ib = i/32;
+    return (float) blocks[ib].d * (float) blocks[ib].qs[i%32];
+}
+
+template<typename T>
+static inline void kernel_nsa_load_row(device const char * p, thread float * dst, int n_dim, int kv_q8) {
+    if (kv_q8) {
+        kernel_nsa_load_q8_0(p, dst, n_dim);
+        return;
+    }
+    device const T * row = (device const T *) p;
+    for (int d = 0; d < n_dim; ++d) {
+        dst[d] = (float) row[d];
+    }
+}
+
 template<typename T>
 static inline void kernel_nsa_attend(
         device const float * q,
@@ -14472,19 +14501,31 @@ static inline void kernel_nsa_attend(
         thread float & m,
         thread float & s,
         int n_dim,
-        float scale) {
-    device const T * kk = (device const T *) krow;
-    device const T * vv = (device const T *) vrow;
+        float scale,
+        int kv_q8) {
+    thread float kbuf[128];
+    thread float vbuf[128];
+    if (kv_q8) {
+        kernel_nsa_load_q8_0(krow, kbuf, n_dim);
+        kernel_nsa_load_q8_0(vrow, vbuf, n_dim);
+    } else {
+        device const T * kk = (device const T *) krow;
+        device const T * vv = (device const T *) vrow;
+        for (int d = 0; d < n_dim; ++d) {
+            kbuf[d] = (float) kk[d];
+            vbuf[d] = (float) vv[d];
+        }
+    }
     float dot = 0.0f;
     for (int d = 0; d < n_dim; ++d) {
-        dot += q[d] * (float) kk[d];
+        dot += q[d] * kbuf[d];
     }
     const float sc = dot*scale;
     const float nm = MAX(m, sc);
     const float pr = exp(m - nm);
     const float w  = exp(sc - nm);
     for (int d = 0; d < n_dim; ++d) {
-        o[d] = o[d]*pr + w*(float) vv[d];
+        o[d] = o[d]*pr + w*vbuf[d];
     }
     s = s*pr + w;
     m = nm;
@@ -14505,11 +14546,12 @@ kernel void kernel_nsa_summary(
     for (int d = 0; d < args.n_dim; ++d) {
         out[d] = 0.0f;
     }
+    thread float row[128];
     for (int j = 0; j < args.block_size; ++j) {
         device const char * p = src + ih*args.nb_k1 + (uint64_t)(ib*args.block_size + j)*args.nb_k2 + is*args.nb_k3;
-        device const T * row = (device const T *) p;
+        kernel_nsa_load_row<T>(p, row, args.n_dim, args.kv_q8);
         for (int d = 0; d < args.n_dim; ++d) {
-            out[d] += (float) row[d];
+            out[d] += row[d];
         }
     }
     for (int d = 0; d < args.n_dim; ++d) {
@@ -14660,7 +14702,7 @@ kernel void kernel_nsa_attention(
         if (last >= args.n_kv || !NSA_VIS(last)) continue;
         device const char * krow = (device const char *) ks + ihk*args.nb_ks1 + ib*args.nb_ks2 + is*args.nb_ks3;
         device const char * vrow = (device const char *) vs + ihk*args.nb_vs1 + ib*args.nb_vs2 + is*args.nb_vs3;
-        kernel_nsa_attend<float>(qv, krow, vrow, outv, m, s, args.n_dim, scale);
+        kernel_nsa_attend<float>(qv, krow, vrow, outv, m, s, args.n_dim, scale, 0);
     }
     NSA_END(0);
 
@@ -14674,7 +14716,7 @@ kernel void kernel_nsa_attention(
             for (int j = 0; j < args.block_size; ++j) {
                 const int ik = ib*args.block_size + j;
                 if (ik >= args.n_kv || !NSA_VIS(ik)) continue;
-                kernel_nsa_attend<T>(qv, NSA_K(ik), NSA_V(ik), outv, m, s, args.n_dim, scale);
+                kernel_nsa_attend<T>(qv, NSA_K(ik), NSA_V(ik), outv, m, s, args.n_dim, scale, args.kv_q8);
             }
         }
     }
@@ -14690,7 +14732,7 @@ kernel void kernel_nsa_attention(
         const int ib_begin = (args.local_size > 0 && ik_q >= 0) ? MAX(0, ik_q - args.local_size + 1) : args.n_kv;
         for (int ik = ib_begin; ik <= ik_q; ++ik) {
             if (!NSA_VIS(ik)) continue;
-            kernel_nsa_attend<T>(qv, NSA_K(ik), NSA_V(ik), outv, m, s, args.n_dim, scale);
+            kernel_nsa_attend<T>(qv, NSA_K(ik), NSA_V(ik), outv, m, s, args.n_dim, scale, args.kv_q8);
         }
     }
     NSA_END(2);
@@ -14734,11 +14776,12 @@ kernel void kernel_nsa_summary_store(
     for (int d = 0; d < args.n_dim; ++d) {
         out[d] = 0.0f;
     }
+    thread float row[128];
     for (int j = 0; j < args.block_size; ++j) {
         device const char * p = k + ih*args.nb_k1 + (uint64_t)(ib*args.block_size + j)*args.nb_k2 + is*args.nb_k3;
-        device const T * row = (device const T *) p;
+        kernel_nsa_load_row<T>(p, row, args.n_dim, args.kv_q8);
         for (int d = 0; d < args.n_dim; ++d) {
-            out[d] += (float) row[d];
+            out[d] += row[d];
         }
     }
     for (int d = 0; d < args.n_dim; ++d) {
@@ -14762,20 +14805,38 @@ static inline void kernel_nsa_attend_tg(
         thread float & m,
         thread float & s,
         thread float & o0,
-        thread float & o1) {
-    device const T * kk = (device const T *) krow;
-    device const T * vv = (device const T *) vrow;
-    float dot = q[lane] * (float) kk[lane];
+        thread float & o1,
+        int kv_q8) {
+    float k0, v0;
+    float k1 = 0.0f, v1 = 0.0f;
+    if (kv_q8) {
+        k0 = kernel_nsa_load_q8_0_elem(krow, lane);
+        v0 = kernel_nsa_load_q8_0_elem(vrow, lane);
+        if (n_dim > 32) {
+            k1 = kernel_nsa_load_q8_0_elem(krow, lane + 32);
+            v1 = kernel_nsa_load_q8_0_elem(vrow, lane + 32);
+        }
+    } else {
+        device const T * kk = (device const T *) krow;
+        device const T * vv = (device const T *) vrow;
+        k0 = (float) kk[lane];
+        v0 = (float) vv[lane];
+        if (n_dim > 32) {
+            k1 = (float) kk[lane + 32];
+            v1 = (float) vv[lane + 32];
+        }
+    }
+    float dot = q[lane]*k0;
     if (n_dim > 32) {
-        dot += q[lane + 32] * (float) kk[lane + 32];
+        dot += q[lane + 32]*k1;
     }
     const float score = simd_sum(dot) * (1.0f/sqrt((float) n_dim));
     const float nm = MAX(m, score);
     const float pr = exp(m - nm);
     const float w  = exp(score - nm);
-    o0 = o0*pr + w*(float) vv[lane];
+    o0 = o0*pr + w*v0;
     if (n_dim > 32) {
-        o1 = o1*pr + w*(float) vv[lane + 32];
+        o1 = o1*pr + w*v1;
     }
     s = s*pr + w;
     m = nm;
@@ -14825,7 +14886,7 @@ kernel void kernel_nsa_attention_tg(
         if (last >= args.n_kv || !NSA_VIS_TG(last)) continue;
         device const char * kr = (device const char *) ks + ihk*args.nb_ks1 + ib*args.nb_ks2 + is*args.nb_ks3;
         device const char * vr = (device const char *) vs + ihk*args.nb_vs1 + ib*args.nb_vs2 + is*args.nb_vs3;
-        kernel_nsa_attend_tg<float>(qv, lane, args.n_dim, kr, vr, m, s, o0, o1);
+        kernel_nsa_attend_tg<float>(qv, lane, args.n_dim, kr, vr, m, s, o0, o1, 0);
     }
     NSA_WRITE_TG(0, o0, o1, s);
 
@@ -14838,7 +14899,7 @@ kernel void kernel_nsa_attention_tg(
             for (int j = 0; j < args.block_size; ++j) {
                 const int ik = ib*args.block_size + j;
                 if (ik >= args.n_kv || !NSA_VIS_TG(ik)) continue;
-                kernel_nsa_attend_tg<T>(qv, lane, args.n_dim, NSA_K_TG(ik), NSA_V_TG(ik), m, s, o0, o1);
+                kernel_nsa_attend_tg<T>(qv, lane, args.n_dim, NSA_K_TG(ik), NSA_V_TG(ik), m, s, o0, o1, args.kv_q8);
             }
         }
     }
@@ -14853,7 +14914,7 @@ kernel void kernel_nsa_attention_tg(
         const int ib_begin = (args.local_size > 0 && ik_q >= 0) ? MAX(0, ik_q - args.local_size + 1) : args.n_kv;
         for (int ik = ib_begin; ik <= ik_q; ++ik) {
             if (!NSA_VIS_TG(ik)) continue;
-            kernel_nsa_attend_tg<T>(qv, lane, args.n_dim, NSA_K_TG(ik), NSA_V_TG(ik), m, s, o0, o1);
+            kernel_nsa_attend_tg<T>(qv, lane, args.n_dim, NSA_K_TG(ik), NSA_V_TG(ik), m, s, o0, o1, args.kv_q8);
         }
     }
     NSA_WRITE_TG(2, o0, o1, s);
@@ -14889,9 +14950,14 @@ kernel void kernel_nsa_summary_store_tg(
     float a1 = 0.0f;
     for (int j = 0; j < args.block_size; ++j) {
         device const char * p = k + ih*args.nb_k1 + (uint64_t)(ib*args.block_size + j)*args.nb_k2 + is*args.nb_k3;
-        device const T * row = (device const T *) p;
-        a0 += (float) row[lane];
-        if (args.n_dim > 32) a1 += (float) row[lane + 32];
+        if (args.kv_q8) {
+            a0 += kernel_nsa_load_q8_0_elem(p, lane);
+            if (args.n_dim > 32) a1 += kernel_nsa_load_q8_0_elem(p, lane + 32);
+        } else {
+            device const T * row = (device const T *) p;
+            a0 += (float) row[lane];
+            if (args.n_dim > 32) a1 += (float) row[lane + 32];
+        }
     }
     out[lane] = a0 / args.block_size;
     if (args.n_dim > 32) out[lane + 32] = a1 / args.block_size;

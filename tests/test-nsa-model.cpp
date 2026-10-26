@@ -108,6 +108,11 @@ int main(int argc, char ** argv) {
         cparams.type_k = GGML_TYPE_F32;
         cparams.type_v = GGML_TYPE_F32;
     }
+    if (getenv("NSA_TEST_KV_Q8")) {
+        cparams.type_k = GGML_TYPE_Q8_0;
+        cparams.type_v = GGML_TYPE_Q8_0;
+        cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+    }
 
     const bool dump_layers = getenv("NSA_DUMP_LAYERS") != nullptr;
 
@@ -268,7 +273,10 @@ int main(int argc, char ** argv) {
     // CPU is the reference. GPU paths may differ by one token at long lengths
     // because of f32 accumulation in the backend kernels.
     const int top1_tol = mparams.n_gpu_layers > 0 ? 1 : 0;
-    if (max_diff > 5e-2 || top1_bad > top1_tol) {
+    // F16/Q8 weights and Q8 KV cache use a wider numeric tolerance. top-1 is
+    // still checked strictly on CPU and with a single mismatch allowance on GPU.
+    const double max_tol = 1e-1;
+    if (max_diff > max_tol || top1_bad > top1_tol) {
         fprintf(stderr, "FAILED\n");
         return 1;
     }

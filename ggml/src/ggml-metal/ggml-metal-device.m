@@ -1591,17 +1591,19 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                     return false;
             }
         case GGML_OP_NSA_BLOCK_SUMMARY:
-            return (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16) &&
+            return (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16 || op->src[0]->type == GGML_TYPE_Q8_0) &&
                 op->type == GGML_TYPE_F32 &&
                 op->src[0]->ne[0] <= 128 &&
+                (op->src[0]->type != GGML_TYPE_Q8_0 || op->src[0]->ne[0] % 32 == 0) &&
                 op->src[0]->ne[2] % ggml_get_op_params_i32(op, 0) == 0 &&
                 ggml_is_contiguous_rows(op->src[0]);
         case GGML_OP_NSA_SUMMARY_STORE:
-            return (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16) &&
+            return (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16 || op->src[0]->type == GGML_TYPE_Q8_0) &&
                 op->src[1]->type == GGML_TYPE_F32 &&
                 op->src[2]->type == GGML_TYPE_I32 &&
                 op->type == GGML_TYPE_F32 &&
                 op->src[0]->ne[0] <= 128 &&
+                (op->src[0]->type != GGML_TYPE_Q8_0 || op->src[0]->ne[0] % 32 == 0) &&
                 ggml_is_contiguous_rows(op->src[0]);
         case GGML_OP_NSA_SELECT_BLOCKS:
             return op->src[0]->type == GGML_TYPE_F32 &&
@@ -1615,8 +1617,9 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                 ggml_is_contiguous_rows(op->src[1]);
         case GGML_OP_NSA_ATTENTION:
             return op->src[0]->type == GGML_TYPE_F32 &&
-                (op->src[1]->type == GGML_TYPE_F32 || op->src[1]->type == GGML_TYPE_F16) &&
+                (op->src[1]->type == GGML_TYPE_F32 || op->src[1]->type == GGML_TYPE_F16 || op->src[1]->type == GGML_TYPE_Q8_0) &&
                 op->src[2]->type == op->src[1]->type &&
+                (op->src[1]->type != GGML_TYPE_Q8_0 || op->src[1]->ne[0] % 32 == 0) &&
                 op->src[3]->type == GGML_TYPE_F32 &&
                 op->src[4]->type == GGML_TYPE_F32 &&
                 op->src[5]->type == GGML_TYPE_I32 &&
