@@ -21,7 +21,9 @@ class HybridGatedDeltaNetModel(TextModel):
         self._gdn_conv: dict[int, dict[str, Tensor]] = {}
 
     def set_vocab(self):
+        # the checkpoint uses a sentencepiece-style BPE: the text starts with a space
         self._set_vocab_gpt2()
+        self.gguf_writer.add_add_space_prefix(True)
 
     def get_vocab_base_pre(self, tokenizer) -> str:
         return "gemma4"

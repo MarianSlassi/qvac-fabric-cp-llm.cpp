@@ -14449,3 +14449,265 @@ kernel void kernel_dsv4_hc_post_f32(
         *(device float *) (dst + i0*args.nb_d0 + idst*args.nb_d1 + it*args.nb_d2) = result[idst];
     }
 }
+
+// Native sparse attention
+//
+// One thread per output row. The three ops are intentionally simple; they are
+// used to keep the GPU path free of a CPU fallback for the hybrid model.
+
+static inline bool kernel_nsa_visible(device const char * row, int ik, uint64_t nb0, int is_f16) {
+    const device char * p = row + (uint64_t) ik*nb0;
+    if (is_f16) {
+        return isfinite((float) *(device const half *) p);
+    }
+    return isfinite(*(device const float *) p);
+}
+
+template<typename T>
+static inline void kernel_nsa_attend(
+        device const float * q,
+        device const char * krow,
+        device const char * vrow,
+        thread float * o,
+        thread float & m,
+        thread float & s,
+        int n_dim,
+        float scale) {
+    device const T * kk = (device const T *) krow;
+    device const T * vv = (device const T *) vrow;
+    float dot = 0.0f;
+    for (int d = 0; d < n_dim; ++d) {
+        dot += q[d] * (float) kk[d];
+    }
+    const float sc = dot*scale;
+    const float nm = MAX(m, sc);
+    const float pr = exp(m - nm);
+    const float w  = exp(sc - nm);
+    for (int d = 0; d < n_dim; ++d) {
+        o[d] = o[d]*pr + w*(float) vv[d];
+    }
+    s = s*pr + w;
+    m = nm;
+}
+
+template<typename T>
+kernel void kernel_nsa_summary(
+        constant ggml_metal_kargs_nsa & args,
+        device const char * src [[buffer(1)]],
+        device float      * dst [[buffer(2)]],
+        uint3 tgpig [[threadgroup_position_in_grid]]) {
+    const int ir = (int) tgpig.x;
+    const int ib = ir % args.n_block;
+    const int ih = (ir/args.n_block) % args.n_kv_head;
+    const int is = ir/(args.n_block*args.n_kv_head);
+
+    device float * out = (device float *) ((device char *) dst + ih*args.nb_ks1 + ib*args.nb_ks2 + is*args.nb_ks3);
+    for (int d = 0; d < args.n_dim; ++d) {
+        out[d] = 0.0f;
+    }
+    for (int j = 0; j < args.block_size; ++j) {
+        device const char * p = src + ih*args.nb_k1 + (uint64_t)(ib*args.block_size + j)*args.nb_k2 + is*args.nb_k3;
+        device const T * row = (device const T *) p;
+        for (int d = 0; d < args.n_dim; ++d) {
+            out[d] += (float) row[d];
+        }
+    }
+    for (int d = 0; d < args.n_dim; ++d) {
+        out[d] /= args.block_size;
+    }
+}
+
+kernel void kernel_nsa_select(
+        constant ggml_metal_kargs_nsa & args,
+        device const float * q    [[buffer(1)]],
+        device const float * ks   [[buffer(2)]],
+        device const char  * mask [[buffer(3)]],
+        device int         * out  [[buffer(4)]],
+        uint3 tgpig [[threadgroup_position_in_grid]]) {
+    const int ir = (int) tgpig.x;
+    const int ih = ir % args.n_kv_head;
+    const int it = (ir/args.n_kv_head) % args.n_token;
+    const int is = ir/(args.n_kv_head*args.n_token);
+    const int n_group = args.n_q_head/args.n_kv_head;
+    const int bs = args.block_size;
+    const int n_kv = args.n_kv;
+    const int n_sel = args.n_select;
+
+    device const char * mrow = mask + (uint64_t) it*args.nb_m1 + (uint64_t)(is % args.mask_ne3)*args.nb_m3;
+    #define NSA_VIS(ik) kernel_nsa_visible(mrow, (ik), args.nb_m0, args.mask_f16)
+
+    int ik_q = -1;
+    for (int ik = n_kv - 1; ik >= 0; --ik) {
+        if (NSA_VIS(ik)) { ik_q = ik; break; }
+    }
+    const int ib_q = ik_q >= 0 ? ik_q/bs : -1;
+
+    float lse[32];
+    for (int i = 0; i < 32; ++i) {
+        lse[i] = 0.0f;
+    }
+    const float scale = 1.0f/sqrt((float) args.n_dim);
+
+    for (int ib = 0; ib < args.n_block; ++ib) {
+        const int last = (ib + 1)*bs - 1;
+        if (last >= n_kv || !NSA_VIS(last)) continue;
+        device const float * krow = (device const float *) ((device const char *) ks + ih*args.nb_ks1 + ib*args.nb_ks2 + is*args.nb_ks3);
+        for (int iq = 0; iq < n_group; ++iq) {
+            device const float * qv = (device const float *) ((device const char *) q + (uint64_t)(ih*n_group + iq)*args.nb_q1 + (uint64_t) it*args.nb_q2 + (uint64_t) is*args.nb_q3);
+            float dot = 0.0f;
+            for (int d = 0; d < args.n_dim; ++d) {
+                dot += qv[d]*krow[d];
+            }
+            lse[iq] += exp(dot*scale);
+        }
+    }
+    for (int iq = 0; iq < n_group; ++iq) {
+        lse[iq] = lse[iq] > 0.0f ? log(lse[iq]) : 0.0f;
+    }
+
+    float best[32];
+    int   best_i[32];
+    for (int i = 0; i < 32; ++i) {
+        best[i] = -INFINITY;
+        best_i[i] = -1;
+    }
+
+    const int ib_max = MAX(args.n_block - 1, ib_q);
+    for (int ib = 0; ib <= ib_max; ++ib) {
+        const int last = (ib + 1)*bs - 1;
+        const bool is_current = (ib == ib_q);
+        const bool complete = (ib < args.n_block) && (last < n_kv) && NSA_VIS(last);
+        if (!complete && !is_current) continue;
+
+        float score = 0.0f;
+        if (complete) {
+            device const float * krow = (device const float *) ((device const char *) ks + ih*args.nb_ks1 + ib*args.nb_ks2 + is*args.nb_ks3);
+            for (int iq = 0; iq < n_group; ++iq) {
+                device const float * qv = (device const float *) ((device const char *) q + (uint64_t)(ih*n_group + iq)*args.nb_q1 + (uint64_t) it*args.nb_q2 + (uint64_t) is*args.nb_q3);
+                float dot = 0.0f;
+                for (int d = 0; d < args.n_dim; ++d) {
+                    dot += qv[d]*krow[d];
+                }
+                score += exp(dot*scale - lse[iq]);
+            }
+        } else {
+            score = (float) n_group;
+        }
+        if (ib == 0 || ib == ib_q || ib == ib_q - 1) {
+            score += 1.0e9f;
+        }
+        for (int s = 0; s < n_sel; ++s) {
+            if (score > best[s]) {
+                for (int j = n_sel - 1; j > s; --j) {
+                    best[j] = best[j - 1];
+                    best_i[j] = best_i[j - 1];
+                }
+                best[s] = score;
+                best_i[s] = ib;
+                break;
+            }
+        }
+    }
+
+    device int * o = (device int *) ((device char *) out + ih*args.nb_i1 + (uint64_t) it*args.nb_i2 + is*args.nb_i3);
+    for (int s = 0; s < n_sel; ++s) {
+        o[s] = best_i[s];
+    }
+    #undef NSA_VIS
+}
+
+template<typename T>
+kernel void kernel_nsa_attention(
+        constant ggml_metal_kargs_nsa & args,
+        device const float * q    [[buffer(1)]],
+        device const char  * k    [[buffer(2)]],
+        device const char  * v    [[buffer(3)]],
+        device const float * ks   [[buffer(4)]],
+        device const float * vs   [[buffer(5)]],
+        device const int   * idx  [[buffer(6)]],
+        device const char  * mask [[buffer(7)]],
+        device float       * dst  [[buffer(8)]],
+        uint3 tgpig [[threadgroup_position_in_grid]]) {
+    const int ir = (int) tgpig.x;
+    const int ihq = ir % args.n_q_head;
+    const int it  = (ir/args.n_q_head) % args.n_token;
+    const int is  = ir/(args.n_q_head*args.n_token);
+    const int ihk = ihq/(args.n_q_head/args.n_kv_head);
+    const float scale = 1.0f/sqrt((float) args.n_dim);
+
+    device const float * qv = (device const float *) ((device const char *) q + (uint64_t) ihq*args.nb_q1 + (uint64_t) it*args.nb_q2 + (uint64_t) is*args.nb_q3);
+    device const char * mrow = mask + (uint64_t) it*args.nb_m1 + (uint64_t)(is % args.mask_ne3)*args.nb_m3;
+    #define NSA_VIS(ik) kernel_nsa_visible(mrow, (ik), args.nb_m0, args.mask_f16)
+    #define NSA_K(ik) ((device const char *) k + ihk*args.nb_k1 + (uint64_t)(ik)*args.nb_k2 + is*args.nb_k3)
+    #define NSA_V(ik) ((device const char *) v + ihk*args.nb_v1 + (uint64_t)(ik)*args.nb_v2 + is*args.nb_v3)
+
+    float outv[128];
+    float m = 0.0f;
+    float s = 0.0f;
+
+    #define NSA_BEGIN() do { for (int d = 0; d < args.n_dim; ++d) outv[d] = 0.0f; m = -INFINITY; s = 0.0f; } while (0)
+    #define NSA_END(br) do { \
+        if (s > 0.0f) { for (int d = 0; d < args.n_dim; ++d) outv[d] /= s; } \
+        device float * o = (device float *) ((device char *) dst + (uint64_t) ihq*args.nb_o1 + \
+                (uint64_t)((br)*args.n_token + it)*args.nb_o2 + (uint64_t) is*args.nb_o3); \
+        for (int d = 0; d < args.n_dim; ++d) o[d] = outv[d]; \
+    } while (0)
+
+    // compressed branch
+    NSA_BEGIN();
+    for (int ib = 0; ib < args.n_block; ++ib) {
+        const int last = (ib + 1)*args.block_size - 1;
+        if (last >= args.n_kv || !NSA_VIS(last)) continue;
+        device const char * krow = (device const char *) ks + ihk*args.nb_ks1 + ib*args.nb_ks2 + is*args.nb_ks3;
+        device const char * vrow = (device const char *) vs + ihk*args.nb_vs1 + ib*args.nb_vs2 + is*args.nb_vs3;
+        kernel_nsa_attend<float>(qv, krow, vrow, outv, m, s, args.n_dim, scale);
+    }
+    NSA_END(0);
+
+    // selected branch
+    NSA_BEGIN();
+    {
+        device const int * sel = (device const int *) ((device const char *) idx + ihk*args.nb_i1 + (uint64_t) it*args.nb_i2 + is*args.nb_i3);
+        for (int i = 0; i < args.n_select; ++i) {
+            const int ib = sel[i];
+            if (ib < 0) continue;
+            for (int j = 0; j < args.block_size; ++j) {
+                const int ik = ib*args.block_size + j;
+                if (ik >= args.n_kv || !NSA_VIS(ik)) continue;
+                kernel_nsa_attend<T>(qv, NSA_K(ik), NSA_V(ik), outv, m, s, args.n_dim, scale);
+            }
+        }
+    }
+    NSA_END(1);
+
+    // local branch
+    NSA_BEGIN();
+    {
+        int ik_q = -1;
+        for (int ik = args.n_kv - 1; ik >= 0; --ik) {
+            if (NSA_VIS(ik)) { ik_q = ik; break; }
+        }
+        const int ib_begin = (args.local_size > 0 && ik_q >= 0) ? MAX(0, ik_q - args.local_size + 1) : args.n_kv;
+        for (int ik = ib_begin; ik <= ik_q; ++ik) {
+            if (!NSA_VIS(ik)) continue;
+            kernel_nsa_attend<T>(qv, NSA_K(ik), NSA_V(ik), outv, m, s, args.n_dim, scale);
+        }
+    }
+    NSA_END(2);
+
+    #undef NSA_BEGIN
+    #undef NSA_END
+    #undef NSA_K
+    #undef NSA_V
+    #undef NSA_VIS
+}
+
+typedef decltype(kernel_nsa_summary<half>)  kernel_nsa_summary_half_t;
+typedef decltype(kernel_nsa_summary<float>) kernel_nsa_summary_float_t;
+typedef decltype(kernel_nsa_attention<half>)  kernel_nsa_attention_half_t;
+typedef decltype(kernel_nsa_attention<float>) kernel_nsa_attention_float_t;
+
+template [[host_name("kernel_nsa_summary_f16")]]   kernel kernel_nsa_summary_half_t  kernel_nsa_summary<half>;
+template [[host_name("kernel_nsa_summary_f32")]]   kernel kernel_nsa_summary_float_t kernel_nsa_summary<float>;
+template [[host_name("kernel_nsa_attention_f16")]] kernel kernel_nsa_attention_half_t  kernel_nsa_attention<half>;
+template [[host_name("kernel_nsa_attention_f32")]] kernel kernel_nsa_attention_float_t kernel_nsa_attention<float>;

@@ -13361,7 +13361,8 @@ void ggml_compute_forward_nsa_block_summary(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
     const ggml_tensor * src = dst->src[0];
-    GGML_ASSERT(src->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+    const ggml_to_float_t to_float = ggml_get_type_traits(src->type)->to_float;
+    GGML_ASSERT((src->type == GGML_TYPE_F32 || to_float) && dst->type == GGML_TYPE_F32);
 
     const int32_t block_size = ggml_get_op_params_i32(dst, 0);
     const int64_t n_dim = src->ne[0];
@@ -13379,9 +13380,15 @@ void ggml_compute_forward_nsa_block_summary(
         const int64_t is = ir/(n_block*n_head);
         float * out = (float *) ((char *) dst->data + ih*dst->nb[1] + ib*dst->nb[2] + is*dst->nb[3]);
         ggml_vec_set_f32(n_dim, out, 0.0f);
+        std::vector<float> row(n_dim);
         for (int32_t it = 0; it < block_size; ++it) {
-            const float * in = (const float *) ((const char *) src->data + ih*src->nb[1] + (ib*block_size + it)*src->nb[2] + is*src->nb[3]);
-            ggml_vec_acc_f32(n_dim, out, in);
+            const void * in = (const void *) ((const char *) src->data + ih*src->nb[1] + (ib*block_size + it)*src->nb[2] + is*src->nb[3]);
+            if (to_float) {
+                to_float(in, row.data(), n_dim);
+            } else {
+                memcpy(row.data(), in, n_dim*sizeof(float));
+            }
+            ggml_vec_acc_f32(n_dim, out, row.data());
         }
         ggml_vec_scale_f32(n_dim, out, 1.0f/block_size);
     }
@@ -13392,36 +13399,94 @@ void ggml_compute_forward_nsa_select_blocks(
         ggml_tensor * dst) {
     const ggml_tensor * q = dst->src[0];
     const ggml_tensor * k = dst->src[1];
+    const ggml_tensor * mask = dst->src[2];
     GGML_ASSERT(q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_I32);
+    GGML_ASSERT(mask->type == GGML_TYPE_F32 || mask->type == GGML_TYPE_F16);
 
+    const int32_t block_size = ggml_get_op_params_i32(dst, 0);
     const int64_t n_dim = q->ne[0];
     const int64_t n_q_head = q->ne[1];
     const int64_t n_kv_head = k->ne[1];
     const int64_t n_block = k->ne[2];
+    const int64_t n_kv = mask->ne[0];
     const int64_t n_token = q->ne[2];
     const int64_t n_stream = q->ne[3];
     const int64_t n_select = dst->ne[0];
     const int64_t n_group = n_q_head/n_kv_head;
     const int64_t n_rows = n_kv_head*n_token*n_stream;
     const int64_t dr = (n_rows + params->nth - 1)/params->nth;
+    const float scale = 1.0f/sqrtf(n_dim);
 
-    for (int64_t ir = dr*params->ith; ir < MIN<int64_t>(dr*(params->ith + 1), n_rows); ++ir) {
+    for (int64_t ir = dr*params->ith; ir < std::min<int64_t>(dr*(params->ith + 1), n_rows); ++ir) {
         const int64_t ih = ir % n_kv_head;
         const int64_t it = (ir/n_kv_head) % n_token;
         const int64_t is = ir/(n_kv_head*n_token);
         int32_t * out = (int32_t *) ((char *) dst->data + ih*dst->nb[1] + it*dst->nb[2] + is*dst->nb[3]);
         std::vector<float> best_score(n_select, -INFINITY);
         std::vector<int32_t> best_index(n_select, -1);
+
+        const char * mask_row = (const char *) mask->data + it*mask->nb[1] + (is % mask->ne[3])*mask->nb[3];
+        auto visible = [&](int64_t ik) {
+            const char * p = mask_row + ik*mask->nb[0];
+            return std::isfinite(mask->type == GGML_TYPE_F32 ? *(const float *) p : GGML_CPU_FP16_TO_FP32(*(const ggml_fp16_t *) p));
+        };
+        // the query cell is the last visible cell of the causal mask. the cache is
+        // allocated for the full context, so n_kv is not the number of used cells.
+        int64_t ik_q = -1;
+        for (int64_t ik = n_kv - 1; ik >= 0; --ik) {
+            if (visible(ik)) {
+                ik_q = ik;
+                break;
+            }
+        }
+        const int64_t ib_q = ik_q >= 0 ? ik_q/block_size : -1;
+
+        // scores of the complete blocks, and their normalizer per query head
+        std::vector<float> scores(n_block*n_group, 0.0f);
+        std::vector<float> sum_exp(n_group, 0.0f);
+        std::vector<float> lse(n_group, 0.0f);
+        std::vector<char>  complete(n_block, 0);
         for (int64_t ib = 0; ib < n_block; ++ib) {
+            const int64_t ik_last = (ib + 1)*block_size - 1;
+            if (ik_last >= n_kv || !visible(ik_last)) {
+                continue;
+            }
+            complete[ib] = 1;
             const float * key = (const float *) ((const char *) k->data + ih*k->nb[1] + ib*k->nb[2] + is*k->nb[3]);
-            float score = 0.0f;
             for (int64_t iq = 0; iq < n_group; ++iq) {
                 const float * query = (const float *) ((const char *) q->data + (ih*n_group + iq)*q->nb[1] + it*q->nb[2] + is*q->nb[3]);
                 float dot = 0.0f;
                 ggml_vec_dot_f32(n_dim, &dot, 0, query, 0, key, 0, 1);
-                score += dot;
+                const float s = scale*dot;
+                scores[ib*n_group + iq] = s;
+                sum_exp[iq] += expf(s);
             }
-            score /= n_group;
+        }
+        for (int64_t iq = 0; iq < n_group; ++iq) {
+            lse[iq] = sum_exp[iq] > 0.0f ? logf(sum_exp[iq]) : 0.0f;
+        }
+
+        // rank the blocks that this query can still see. the reference always keeps
+        // the first block and the last two blocks that touch the query.
+        const int64_t ib_max = std::max<int64_t>(n_block - 1, ib_q);
+        for (int64_t ib = 0; ib <= ib_max; ++ib) {
+            const bool is_current = (ib == ib_q);
+            const bool has_summary = (ib < n_block) && complete[ib];
+            if (!has_summary && !is_current) {
+                continue;
+            }
+            float score = 0.0f;
+            if (has_summary) {
+                for (int64_t iq = 0; iq < n_group; ++iq) {
+                    score += expf(scores[ib*n_group + iq] - lse[iq]);
+                }
+            } else {
+                // the current block has no summary yet, keep it unconditionally
+                score = (float) n_group;
+            }
+            if (ib == 0 || ib == ib_q || ib == ib_q - 1) {
+                score += 1.0e9f;
+            }
             for (int64_t isel = 0; isel < n_select; ++isel) {
                 if (score > best_score[isel]) {
                     for (int64_t j = n_select - 1; j > isel; --j) {
@@ -13446,8 +13511,15 @@ void ggml_compute_forward_nsa_attention(
     const ggml_tensor * q = dst->src[0];
     const ggml_tensor * k = dst->src[1];
     const ggml_tensor * v = dst->src[2];
-    const ggml_tensor * indices = dst->src[3];
-    GGML_ASSERT(q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F32 && v->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+    const ggml_tensor * k_summary = dst->src[3];
+    const ggml_tensor * v_summary = dst->src[4];
+    const ggml_tensor * indices = dst->src[5];
+    const ggml_tensor * mask = dst->src[6];
+    const ggml_to_float_t k_to_float = ggml_get_type_traits(k->type)->to_float;
+    const ggml_to_float_t v_to_float = ggml_get_type_traits(v->type)->to_float;
+    GGML_ASSERT(q->type == GGML_TYPE_F32 && k_summary->type == GGML_TYPE_F32 && v_summary->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+    GGML_ASSERT((k->type == GGML_TYPE_F32 || k_to_float) && (v->type == GGML_TYPE_F32 || v_to_float));
+    GGML_ASSERT(mask->type == GGML_TYPE_F32 || mask->type == GGML_TYPE_F16);
 
     const int32_t block_size = ggml_get_op_params_i32(dst, 0);
     const int32_t local_size = ggml_get_op_params_i32(dst, 1);
@@ -13463,35 +13535,82 @@ void ggml_compute_forward_nsa_attention(
     const int64_t dr = (n_rows + params->nth - 1)/params->nth;
     const float scale = 1.0f/sqrtf(n_dim);
 
-    for (int64_t ir = dr*params->ith; ir < MIN<int64_t>(dr*(params->ith + 1), n_rows); ++ir) {
+    for (int64_t ir = dr*params->ith; ir < std::min<int64_t>(dr*(params->ith + 1), n_rows); ++ir) {
         const int64_t ihq = ir % n_q_head;
         const int64_t it = (ir/n_q_head) % n_token;
         const int64_t is = ir/(n_q_head*n_token);
         const int64_t ihk = ihq/n_group;
         const float * query = (const float *) ((const char *) q->data + ihq*q->nb[1] + it*q->nb[2] + is*q->nb[3]);
-        float * out = (float *) ((char *) dst->data + ihq*dst->nb[1] + it*dst->nb[2] + is*dst->nb[3]);
-        ggml_vec_set_f32(n_dim, out, 0.0f);
-        float score_max = -INFINITY;
-        float score_sum = 0.0f;
+        const char * mask_row = (const char *) mask->data + it*mask->nb[1] + (is % mask->ne[3])*mask->nb[3];
         const int32_t * selected = (const int32_t *) ((const char *) indices->data + ihk*indices->nb[1] + it*indices->nb[2] + is*indices->nb[3]);
-        const int64_t local_begin = MAX<int64_t>(0, n_kv - local_size);
-        const int64_t n_candidates = n_select*block_size + n_kv - local_begin;
-        for (int64_t ic = 0; ic < n_candidates; ++ic) {
-            const int64_t ik = ic < n_select*block_size ? selected[ic/block_size]*block_size + ic%block_size : local_begin + ic - n_select*block_size;
-            if (ik < 0 || ik >= n_kv) continue;
-            const float * key = (const float *) ((const char *) k->data + ihk*k->nb[1] + ik*k->nb[2] + is*k->nb[3]);
-            const float * value = (const float *) ((const char *) v->data + ihk*v->nb[1] + ik*v->nb[2] + is*v->nb[3]);
-            float score = 0.0f;
-            ggml_vec_dot_f32(n_dim, &score, 0, query, 0, key, 0, 1);
-            score *= scale;
-            const float new_max = MAX(score_max, score);
-            const float prev = expf(score_max - new_max);
-            const float weight = expf(score - new_max);
-            ggml_vec_scale_f32(n_dim, out, prev);
-            ggml_vec_mad_f32(n_dim, out, value, weight);
-            score_sum = score_sum*prev + weight;
-            score_max = new_max;
-        }
-        if (score_sum > 0.0f) ggml_vec_scale_f32(n_dim, out, 1.0f/score_sum);
+        std::vector<float> key(n_dim);
+        std::vector<float> value(n_dim);
+        auto raw_visible = [&](int64_t ik) {
+            const char * p = mask_row + ik*mask->nb[0];
+            return std::isfinite(mask->type == GGML_TYPE_F32 ? *(const float *) p : GGML_CPU_FP16_TO_FP32(*(const ggml_fp16_t *) p));
+        };
+        auto raw = [&](int64_t ik, float * key_out, float * value_out) {
+            const void * kp = (const void *) ((const char *) k->data + ihk*k->nb[1] + ik*k->nb[2] + is*k->nb[3]);
+            const void * vp = (const void *) ((const char *) v->data + ihk*v->nb[1] + ik*v->nb[2] + is*v->nb[3]);
+            if (k_to_float) k_to_float(kp, key_out, n_dim); else memcpy(key_out, kp, n_dim*sizeof(float));
+            if (v_to_float) v_to_float(vp, value_out, n_dim); else memcpy(value_out, vp, n_dim*sizeof(float));
+        };
+        auto attend = [&](int branch, auto && each) {
+            float * out = (float *) ((char *) dst->data + ihq*dst->nb[1] + (branch*n_token + it)*dst->nb[2] + is*dst->nb[3]);
+            ggml_vec_set_f32(n_dim, out, 0.0f);
+            float score_max = -INFINITY;
+            float score_sum = 0.0f;
+            each([&](const float * key_in, const float * value_in) {
+                float score = 0.0f;
+                ggml_vec_dot_f32(n_dim, &score, 0, query, 0, key_in, 0, 1);
+                score *= scale;
+                const float new_max = MAX(score_max, score);
+                const float prev = expf(score_max - new_max);
+                const float weight = expf(score - new_max);
+                ggml_vec_scale_f32(n_dim, out, prev);
+                ggml_vec_mad_f32(n_dim, out, value_in, weight);
+                score_sum = score_sum*prev + weight;
+                score_max = new_max;
+            });
+            if (score_sum > 0.0f) ggml_vec_scale_f32(n_dim, out, 1.0f/score_sum);
+        };
+        attend(0, [&](auto && consume) {
+            const int64_t n_block = k_summary->ne[2];
+            for (int64_t ib = 0; ib < n_block; ++ib) {
+                const int64_t ik_last = (ib + 1)*block_size - 1;
+                if (ik_last >= n_kv || !raw_visible(ik_last)) continue;
+                const float * ks = (const float *) ((const char *) k_summary->data + ihk*k_summary->nb[1] + ib*k_summary->nb[2] + is*k_summary->nb[3]);
+                const float * vs = (const float *) ((const char *) v_summary->data + ihk*v_summary->nb[1] + ib*v_summary->nb[2] + is*v_summary->nb[3]);
+                consume(ks, vs);
+            }
+        });
+        attend(1, [&](auto && consume) {
+            for (int64_t isel = 0; isel < n_select; ++isel) {
+                const int64_t ib = selected[isel];
+                if (ib < 0) continue;
+                for (int64_t io = 0; io < block_size; ++io) {
+                    const int64_t ik = ib*block_size + io;
+                    if (ik >= n_kv || !raw_visible(ik)) continue;
+                    raw(ik, key.data(), value.data());
+                    consume(key.data(), value.data());
+                }
+            }
+        });
+        attend(2, [&](auto && consume) {
+            // the local branch is anchored at this query, not at the end of the prompt
+            int64_t ik_q = -1;
+            for (int64_t ik = n_kv - 1; ik >= 0; --ik) {
+                if (raw_visible(ik)) {
+                    ik_q = ik;
+                    break;
+                }
+            }
+            const int64_t ik_begin = (local_size > 0 && ik_q >= 0) ? std::max<int64_t>(0, ik_q - local_size + 1) : n_kv;
+            for (int64_t ik = ik_begin; ik <= ik_q; ++ik) {
+                if (!raw_visible(ik)) continue;
+                raw(ik, key.data(), value.data());
+                consume(key.data(), value.data());
+            }
+        });
     }
 }

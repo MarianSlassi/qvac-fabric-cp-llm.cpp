@@ -2725,6 +2725,8 @@ extern "C" {
         struct ggml_context * ctx,
         struct ggml_tensor  * q,
         struct ggml_tensor  * k_summary,
+        struct ggml_tensor  * mask,
+        int32_t               block_size,
         int32_t               n_select);
 
     GGML_API struct ggml_tensor * ggml_nsa_attention(
@@ -2732,7 +2734,10 @@ extern "C" {
         struct ggml_tensor  * q,
         struct ggml_tensor  * k,
         struct ggml_tensor  * v,
+        struct ggml_tensor  * k_summary,
+        struct ggml_tensor  * v_summary,
         struct ggml_tensor  * block_indices,
+        struct ggml_tensor  * mask,
         int32_t               block_size,
         int32_t               local_size);
 

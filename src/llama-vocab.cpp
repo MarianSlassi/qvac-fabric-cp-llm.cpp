@@ -3452,9 +3452,18 @@ std::vector<llama_token> llama_vocab::impl::tokenize(
                 if (add_special) {
                     session->append_bos(output);
                 }
+                // SPM-style BPE (gemma4) starts the text with the word marker. The
+                // flag is ignored by the BPE path unless we add the space here.
+                bool is_prev_special = true;
                 for (const auto & fragment : fragment_buffer) {
                     if (fragment.type == FRAGMENT_BUFFER_VARIANT_TYPE_RAW_TEXT) {
                         std::string text = fragment.raw_text.substr(fragment.offset, fragment.length);
+
+                        if (add_space_prefix && is_prev_special && !text.empty() &&
+                                text[0] != ' ' && text[0] != '\t' && text[0] != '\n') {
+                            text = ' ' + text;
+                        }
+                        is_prev_special = false;
 
                         if (escape_whitespaces) {
                             llama_escape_whitespace(text);
@@ -3466,6 +3475,7 @@ std::vector<llama_token> llama_vocab::impl::tokenize(
                         session->tokenize(text, output);
                     } else { // if (fragment.type == FRAGMENT_BUFFER_VARIANT_TYPE_TOKEN)
                         session->append(fragment.token, output);
+                        is_prev_special = true;
                     }
                 }
 

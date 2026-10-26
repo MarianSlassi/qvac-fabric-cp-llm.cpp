@@ -15,12 +15,13 @@ extern "C" {
 // HELLO fields are uint8_t on the wire, so the value must stay <= 255.
 // 108 adds butterfly communicator rounds and round-tagged peer frames.
 // 109 adds cache flags to SET_TENSOR and SET_TENSOR_2D.
-#define RPC_PROTO_MAJOR_VERSION    109
+// 110 adds the NSA op ids.
+#define RPC_PROTO_MAJOR_VERSION    110
 #define RPC_PROTO_MINOR_VERSION    0
 #define RPC_PROTO_PATCH_VERSION    0
 
 #ifdef  __cplusplus
-static_assert(GGML_OP_COUNT == 113, "GGML_OP_COUNT has changed - update the RPC protocol version");
+static_assert(GGML_OP_COUNT == 116, "GGML_OP_COUNT has changed - update the RPC protocol version");
 #endif
 
 #define GGML_RPC_MAX_SERVERS       16

@@ -532,3 +532,9 @@ if (TARGET gguf-model-data)
     target_link_libraries(test-export-graph-ops PRIVATE gguf-model-data)
     target_compile_definitions(test-export-graph-ops PRIVATE LLAMA_HF_FETCH)
 endif()
+
+# hybrid Gated DeltaNet + NSA end-to-end check. Set NSA_TEST_MODEL to the GGUF file.
+llama_build_and_test(test-nsa-model.cpp LABEL "model")
+set_tests_properties(test-nsa-model PROPERTIES SKIP_RETURN_CODE 77)
+target_include_directories(test-nsa-model PRIVATE ../src)
+llama_build_and_test(test-nsa-ops.cpp)

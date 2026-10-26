@@ -569,6 +569,32 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_lightning_indexe
     return res;
 }
 
+ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_nsa(
+        ggml_metal_library_t lib,
+        const ggml_tensor * op) {
+    const char * name = nullptr;
+
+    switch (op->op) {
+        case GGML_OP_NSA_BLOCK_SUMMARY:
+            name = op->src[0]->type == GGML_TYPE_F16 ? "kernel_nsa_summary_f16" : "kernel_nsa_summary_f32";
+            break;
+        case GGML_OP_NSA_SELECT_BLOCKS:
+            name = "kernel_nsa_select";
+            break;
+        case GGML_OP_NSA_ATTENTION:
+            name = op->src[1]->type == GGML_TYPE_F16 ? "kernel_nsa_attention_f16" : "kernel_nsa_attention_f32";
+            break;
+        default:
+            GGML_ABORT("fatal error");
+    }
+
+    ggml_metal_pipeline_with_params res = ggml_metal_library_get_pipeline(lib, name);
+    if (!res.pipeline) {
+        res = ggml_metal_library_compile_pipeline(lib, name, name, nullptr);
+    }
+    return res;
+}
+
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_dsv4_hc(ggml_metal_library_t lib, ggml_op op) {
     const char * name = nullptr;
 

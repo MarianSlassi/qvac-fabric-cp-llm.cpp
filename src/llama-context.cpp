@@ -255,6 +255,14 @@ llama_context::llama_context(
 
     cparams.n_ubatch = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
 
+    if (model.arch == LLM_ARCH_HYBRID_GATED_DELTANET && cparams.n_ubatch > 64) {
+        // The fused gated delta net chunk kernel in this fork currently returns a
+        // wrong final state when one ubatch holds more than one 64-token chunk.
+        // Processing one block per ubatch keeps prompt processing exact.
+        LLAMA_LOG_WARN("%s: capping n_ubatch to 64 for %s\n", __func__, llm_arch_name(model.arch));
+        cparams.n_ubatch = 64;
+    }
+
     cparams.n_outputs_max = params.n_outputs_max == 0 || llama_model_has_encoder(&model) ? cparams.n_batch : params.n_outputs_max;
     cparams.n_outputs_max_per_seq = params.n_outputs_max_per_seq == 0 ?
             cparams.n_outputs_max : std::min(params.n_outputs_max_per_seq, cparams.n_outputs_max);

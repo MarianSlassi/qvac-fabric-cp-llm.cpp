@@ -1488,3 +1488,27 @@ typedef struct {
 } ggml_metal_kargs_topk_moe;
 
 #endif // GGML_METAL_IMPL
+
+typedef struct {
+    int32_t  op;
+    int32_t  n_dim;
+    int32_t  n_q_head;
+    int32_t  n_kv_head;
+    int32_t  n_block;
+    int32_t  n_kv;
+    int32_t  n_token;
+    int32_t  n_stream;
+    int32_t  block_size;
+    int32_t  n_select;
+    int32_t  local_size;
+    int32_t  mask_ne3;
+    int32_t  mask_f16;
+    uint64_t nb_q1, nb_q2, nb_q3;
+    uint64_t nb_k1, nb_k2, nb_k3;
+    uint64_t nb_v1, nb_v2, nb_v3;
+    uint64_t nb_ks1, nb_ks2, nb_ks3;
+    uint64_t nb_vs1, nb_vs2, nb_vs3;
+    uint64_t nb_m0, nb_m1, nb_m3;
+    uint64_t nb_i1, nb_i2, nb_i3;
+    uint64_t nb_o1, nb_o2, nb_o3;
+} ggml_metal_kargs_nsa;

@@ -352,6 +352,12 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
             {
                 n_fuse = ggml_metal_op_lightning_indexer(ctx, idx);
             } break;
+        case GGML_OP_NSA_BLOCK_SUMMARY:
+        case GGML_OP_NSA_SELECT_BLOCKS:
+        case GGML_OP_NSA_ATTENTION:
+            {
+                n_fuse = ggml_metal_op_nsa(ctx, idx);
+            } break;
         case GGML_OP_DSV4_HC_COMB:
         case GGML_OP_DSV4_HC_PRE:
         case GGML_OP_DSV4_HC_POST:
@@ -1618,6 +1624,168 @@ int ggml_metal_op_lightning_indexer(ggml_metal_op_t ctx, int idx) {
             (k->ne[2] + nkptg - 1)/nkptg,
             (q->ne[2] + nbptg - 1)/nbptg,
             q->ne[3], 32, nsg, 1);
+
+    return 1;
+}
+
+int ggml_metal_op_nsa(ggml_metal_op_t ctx, int idx) {
+    ggml_tensor * op = ctx->node(idx);
+
+    ggml_metal_encoder_t enc = ctx->enc;
+
+    ggml_metal_kargs_nsa args = {};
+
+    switch (op->op) {
+        case GGML_OP_NSA_BLOCK_SUMMARY:
+            {
+                const ggml_tensor * src = op->src[0];
+                GGML_ASSERT(src->type == GGML_TYPE_F32 || src->type == GGML_TYPE_F16);
+                GGML_ASSERT(op->type == GGML_TYPE_F32);
+
+                args.n_dim      = (int32_t) src->ne[0];
+                args.n_kv_head  = (int32_t) src->ne[1];
+                args.n_block    = (int32_t) op->ne[2];
+                args.n_stream   = (int32_t) src->ne[3];
+                args.block_size = ggml_get_op_params_i32(op, 0);
+
+                args.nb_k1  = src->nb[1];
+                args.nb_k2  = src->nb[2];
+                args.nb_k3  = src->nb[3];
+                args.nb_ks1 = op->nb[1];
+                args.nb_ks2 = op->nb[2];
+                args.nb_ks3 = op->nb[3];
+
+                ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(src), 1);
+                ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op),  2);
+
+                auto pipeline = ggml_metal_library_get_pipeline_nsa(ctx->lib, op);
+                ggml_metal_encoder_set_pipeline(enc, pipeline);
+                ggml_metal_encoder_set_bytes(enc, &args, sizeof(args), 0);
+
+                const int n_rows = args.n_kv_head*args.n_block*args.n_stream;
+                ggml_metal_encoder_dispatch_threadgroups(enc, n_rows, 1, 1, 1, 1, 1);
+            } break;
+        case GGML_OP_NSA_SELECT_BLOCKS:
+            {
+                const ggml_tensor * q    = op->src[0];
+                const ggml_tensor * ks   = op->src[1];
+                const ggml_tensor * mask = op->src[2];
+                GGML_ASSERT(q->type == GGML_TYPE_F32);
+                GGML_ASSERT(ks->type == GGML_TYPE_F32);
+                GGML_ASSERT(mask->type == GGML_TYPE_F32 || mask->type == GGML_TYPE_F16);
+                GGML_ASSERT(op->type == GGML_TYPE_I32);
+
+                args.n_dim      = (int32_t) q->ne[0];
+                args.n_q_head   = (int32_t) q->ne[1];
+                args.n_kv_head  = (int32_t) ks->ne[1];
+                args.n_block    = (int32_t) ks->ne[2];
+                args.n_kv       = (int32_t) mask->ne[0];
+                args.n_token    = (int32_t) q->ne[2];
+                args.n_stream   = (int32_t) q->ne[3];
+                args.block_size = ggml_get_op_params_i32(op, 0);
+                args.n_select   = (int32_t) op->ne[0];
+                args.mask_ne3   = (int32_t) mask->ne[3];
+                args.mask_f16   = mask->type == GGML_TYPE_F16;
+
+                args.nb_q1  = q->nb[1];
+                args.nb_q2  = q->nb[2];
+                args.nb_q3  = q->nb[3];
+                args.nb_ks1 = ks->nb[1];
+                args.nb_ks2 = ks->nb[2];
+                args.nb_ks3 = ks->nb[3];
+                args.nb_m0  = mask->nb[0];
+                args.nb_m1  = mask->nb[1];
+                args.nb_m3  = mask->nb[3];
+                args.nb_i1  = op->nb[1];
+                args.nb_i2  = op->nb[2];
+                args.nb_i3  = op->nb[3];
+
+                ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(q),    1);
+                ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(ks),   2);
+                ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(mask), 3);
+                ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op),   4);
+
+                auto pipeline = ggml_metal_library_get_pipeline_nsa(ctx->lib, op);
+                ggml_metal_encoder_set_pipeline(enc, pipeline);
+                ggml_metal_encoder_set_bytes(enc, &args, sizeof(args), 0);
+
+                const int n_rows = args.n_kv_head*args.n_token*args.n_stream;
+                ggml_metal_encoder_dispatch_threadgroups(enc, n_rows, 1, 1, 1, 1, 1);
+            } break;
+        case GGML_OP_NSA_ATTENTION:
+            {
+                const ggml_tensor * q    = op->src[0];
+                const ggml_tensor * k    = op->src[1];
+                const ggml_tensor * v    = op->src[2];
+                const ggml_tensor * ks   = op->src[3];
+                const ggml_tensor * vs   = op->src[4];
+                const ggml_tensor * idxs = op->src[5];
+                const ggml_tensor * mask = op->src[6];
+                GGML_ASSERT(q->type == GGML_TYPE_F32);
+                GGML_ASSERT(k->type == GGML_TYPE_F32 || k->type == GGML_TYPE_F16);
+                GGML_ASSERT(v->type == k->type);
+                GGML_ASSERT(ks->type == GGML_TYPE_F32 && vs->type == GGML_TYPE_F32);
+                GGML_ASSERT(idxs->type == GGML_TYPE_I32);
+                GGML_ASSERT(mask->type == GGML_TYPE_F32 || mask->type == GGML_TYPE_F16);
+                GGML_ASSERT(op->type == GGML_TYPE_F32);
+
+                args.n_dim      = (int32_t) q->ne[0];
+                args.n_q_head   = (int32_t) q->ne[1];
+                args.n_kv_head  = (int32_t) k->ne[1];
+                args.n_kv       = (int32_t) k->ne[2];
+                args.n_token    = (int32_t) q->ne[2];
+                args.n_stream   = (int32_t) q->ne[3];
+                args.n_block    = (int32_t) ks->ne[2];
+                args.n_select   = (int32_t) idxs->ne[0];
+                args.block_size = ggml_get_op_params_i32(op, 0);
+                args.local_size = ggml_get_op_params_i32(op, 1);
+                args.mask_ne3   = (int32_t) mask->ne[3];
+                args.mask_f16   = mask->type == GGML_TYPE_F16;
+
+                args.nb_q1  = q->nb[1];
+                args.nb_q2  = q->nb[2];
+                args.nb_q3  = q->nb[3];
+                args.nb_k1  = k->nb[1];
+                args.nb_k2  = k->nb[2];
+                args.nb_k3  = k->nb[3];
+                args.nb_v1  = v->nb[1];
+                args.nb_v2  = v->nb[2];
+                args.nb_v3  = v->nb[3];
+                args.nb_ks1 = ks->nb[1];
+                args.nb_ks2 = ks->nb[2];
+                args.nb_ks3 = ks->nb[3];
+                args.nb_vs1 = vs->nb[1];
+                args.nb_vs2 = vs->nb[2];
+                args.nb_vs3 = vs->nb[3];
+                args.nb_m0  = mask->nb[0];
+                args.nb_m1  = mask->nb[1];
+                args.nb_m3  = mask->nb[3];
+                args.nb_i1  = idxs->nb[1];
+                args.nb_i2  = idxs->nb[2];
+                args.nb_i3  = idxs->nb[3];
+                args.nb_o1  = op->nb[1];
+                args.nb_o2  = op->nb[2];
+                args.nb_o3  = op->nb[3];
+
+                ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(q),    1);
+                ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(k),    2);
+                ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(v),    3);
+                ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(ks),   4);
+                ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(vs),   5);
+                ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(idxs), 6);
+                ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(mask), 7);
+                ggml_metal_encoder_set_buffer(enc, ggml_metal_get_buffer_id(op),   8);
+
+                auto pipeline = ggml_metal_library_get_pipeline_nsa(ctx->lib, op);
+                ggml_metal_encoder_set_pipeline(enc, pipeline);
+                ggml_metal_encoder_set_bytes(enc, &args, sizeof(args), 0);
+
+                const int n_rows = args.n_q_head*args.n_token*args.n_stream;
+                ggml_metal_encoder_dispatch_threadgroups(enc, n_rows, 1, 1, 1, 1, 1);
+            } break;
+        default:
+            GGML_ABORT("fatal error");
+    }
 
     return 1;
 }
