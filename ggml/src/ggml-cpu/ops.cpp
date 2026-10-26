@@ -13356,3 +13356,33 @@ void ggml_compute_forward_lightning_indexer(
         }
     }
 }
+
+void ggml_compute_forward_nsa_block_summary(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * src = dst->src[0];
+    GGML_ASSERT(src->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+
+    const int32_t block_size = ggml_get_op_params_i32(dst, 0);
+    const int64_t n_dim = src->ne[0];
+    const int64_t n_head = src->ne[1];
+    const int64_t n_block = dst->ne[2];
+    const int64_t n_stream = src->ne[3];
+    const int64_t n_rows = n_head*n_block*n_stream;
+    const int64_t dr = (n_rows + params->nth - 1)/params->nth;
+    const int64_t ir0 = dr*params->ith;
+    const int64_t ir1 = MIN(ir0 + dr, n_rows);
+
+    for (int64_t ir = ir0; ir < ir1; ++ir) {
+        const int64_t ib = ir % n_block;
+        const int64_t ih = (ir/n_block) % n_head;
+        const int64_t is = ir/(n_block*n_head);
+        float * out = (float *) ((char *) dst->data + ih*dst->nb[1] + ib*dst->nb[2] + is*dst->nb[3]);
+        ggml_vec_set_f32(n_dim, out, 0.0f);
+        for (int32_t it = 0; it < block_size; ++it) {
+            const float * in = (const float *) ((const char *) src->data + ih*src->nb[1] + (ib*block_size + it)*src->nb[2] + is*src->nb[3]);
+            ggml_vec_acc_f32(n_dim, out, in);
+        }
+        ggml_vec_scale_f32(n_dim, out, 1.0f/block_size);
+    }
+}

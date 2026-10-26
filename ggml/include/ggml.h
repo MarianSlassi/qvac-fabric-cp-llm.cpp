@@ -589,6 +589,9 @@ extern "C" {
         GGML_OP_GATED_DELTA_NET,
         GGML_OP_GATED_DELTA_NET_BACK,
         GGML_OP_LIGHTNING_INDEXER,
+        GGML_OP_NSA_BLOCK_SUMMARY,
+        GGML_OP_NSA_SELECT_BLOCKS,
+        GGML_OP_NSA_ATTENTION,
         GGML_OP_DSV4_HC_COMB,
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
@@ -2712,6 +2715,26 @@ extern "C" {
         struct ggml_tensor  * k,
         struct ggml_tensor  * weights,
         struct ggml_tensor  * mask);
+
+    GGML_API struct ggml_tensor * ggml_nsa_block_summary(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * kv,
+        int32_t               block_size);
+
+    GGML_API struct ggml_tensor * ggml_nsa_select_blocks(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k_summary,
+        int32_t               n_select);
+
+    GGML_API struct ggml_tensor * ggml_nsa_attention(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * block_indices,
+        int32_t               block_size,
+        int32_t               local_size);
 
     // DeepSeek V4 hyper-connections (ref. https://arxiv.org/pdf/2512.24880)
     // In short these operations are replacements for the original residual connection (x = transformer(x) + x)

@@ -1154,6 +1154,9 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GATED_DELTA_NET",
     "GATED_DELTA_NET_BACK",
     "LIGHTNING_INDEXER",
+    "NSA_BLOCK_SUMMARY",
+    "NSA_SELECT_BLOCKS",
+    "NSA_ATTENTION",
     "DSV4_HC_COMB",
     "DSV4_HC_PRE",
     "DSV4_HC_POST",
@@ -6735,6 +6738,66 @@ struct ggml_tensor * ggml_lightning_indexer(
     result->src[2] = weights;
     result->src[3] = mask;
 
+    return result;
+}
+
+struct ggml_tensor * ggml_nsa_block_summary(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * kv,
+        int32_t               block_size) {
+    GGML_ASSERT(block_size > 0);
+    GGML_ASSERT(kv->n_dims == 4);
+    GGML_ASSERT(kv->ne[2] % block_size == 0);
+
+    int64_t ne[4] = { kv->ne[0], kv->ne[1], kv->ne[2] / block_size, kv->ne[3] };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+    result->op = GGML_OP_NSA_BLOCK_SUMMARY;
+    result->src[0] = kv;
+    ggml_set_op_params_i32(result, 0, block_size);
+    return result;
+}
+
+struct ggml_tensor * ggml_nsa_select_blocks(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k_summary,
+        int32_t               n_select) {
+    GGML_ASSERT(n_select > 0);
+    GGML_ASSERT(q->n_dims == 4 && k_summary->n_dims == 4);
+    GGML_ASSERT(q->ne[0] == k_summary->ne[0]);
+    GGML_ASSERT(q->ne[3] == k_summary->ne[3]);
+    GGML_ASSERT(q->ne[1] % k_summary->ne[1] == 0);
+
+    int64_t ne[4] = { n_select, k_summary->ne[1], q->ne[2], q->ne[3] };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_I32, 4, ne);
+    result->op = GGML_OP_NSA_SELECT_BLOCKS;
+    result->src[0] = q;
+    result->src[1] = k_summary;
+    return result;
+}
+
+struct ggml_tensor * ggml_nsa_attention(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * block_indices,
+        int32_t               block_size,
+        int32_t               local_size) {
+    GGML_ASSERT(block_size > 0 && local_size >= 0);
+    GGML_ASSERT(q->n_dims == 4 && k->n_dims == 4 && v->n_dims == 4 && block_indices->type == GGML_TYPE_I32);
+    GGML_ASSERT(q->ne[0] == k->ne[0] && k->ne[0] == v->ne[0]);
+    GGML_ASSERT(q->ne[1] % k->ne[1] == 0 && k->ne[1] == v->ne[1]);
+    GGML_ASSERT(q->ne[2] == block_indices->ne[2] && q->ne[3] == block_indices->ne[3]);
+
+    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, q->ne[0], q->ne[1], q->ne[2], q->ne[3]);
+    result->op = GGML_OP_NSA_ATTENTION;
+    result->src[0] = q;
+    result->src[1] = k;
+    result->src[2] = v;
+    result->src[3] = block_indices;
+    ggml_set_op_params_i32(result, 0, block_size);
+    ggml_set_op_params_i32(result, 1, local_size);
     return result;
 }
 

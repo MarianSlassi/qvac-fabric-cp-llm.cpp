@@ -2182,6 +2182,14 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_lightning_indexer(params, tensor);
             } break;
+        case GGML_OP_NSA_BLOCK_SUMMARY:
+            {
+                ggml_compute_forward_nsa_block_summary(params, tensor);
+            } break;
+        case GGML_OP_NSA_SELECT_BLOCKS:
+            {
+                ggml_compute_forward_nsa_select_blocks(params, tensor);
+            } break;
         case GGML_OP_DSV4_HC_COMB:
             {
                 ggml_compute_forward_dsv4_hc_comb(params, tensor);
