@@ -118,6 +118,7 @@ void ggml_compute_forward_gated_delta_net_back(const struct ggml_compute_params 
 void ggml_compute_forward_lightning_indexer(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_nsa_block_summary(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_nsa_select_blocks(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+void ggml_compute_forward_nsa_attention(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_dsv4_hc_comb(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_dsv4_hc_pre(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_dsv4_hc_post(const struct ggml_compute_params * params, struct ggml_tensor * dst);

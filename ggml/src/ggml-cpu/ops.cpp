@@ -13386,3 +13386,112 @@ void ggml_compute_forward_nsa_block_summary(
         ggml_vec_scale_f32(n_dim, out, 1.0f/block_size);
     }
 }
+
+void ggml_compute_forward_nsa_select_blocks(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * q = dst->src[0];
+    const ggml_tensor * k = dst->src[1];
+    GGML_ASSERT(q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_I32);
+
+    const int64_t n_dim = q->ne[0];
+    const int64_t n_q_head = q->ne[1];
+    const int64_t n_kv_head = k->ne[1];
+    const int64_t n_block = k->ne[2];
+    const int64_t n_token = q->ne[2];
+    const int64_t n_stream = q->ne[3];
+    const int64_t n_select = dst->ne[0];
+    const int64_t n_group = n_q_head/n_kv_head;
+    const int64_t n_rows = n_kv_head*n_token*n_stream;
+    const int64_t dr = (n_rows + params->nth - 1)/params->nth;
+
+    for (int64_t ir = dr*params->ith; ir < MIN<int64_t>(dr*(params->ith + 1), n_rows); ++ir) {
+        const int64_t ih = ir % n_kv_head;
+        const int64_t it = (ir/n_kv_head) % n_token;
+        const int64_t is = ir/(n_kv_head*n_token);
+        int32_t * out = (int32_t *) ((char *) dst->data + ih*dst->nb[1] + it*dst->nb[2] + is*dst->nb[3]);
+        std::vector<float> best_score(n_select, -INFINITY);
+        std::vector<int32_t> best_index(n_select, -1);
+        for (int64_t ib = 0; ib < n_block; ++ib) {
+            const float * key = (const float *) ((const char *) k->data + ih*k->nb[1] + ib*k->nb[2] + is*k->nb[3]);
+            float score = 0.0f;
+            for (int64_t iq = 0; iq < n_group; ++iq) {
+                const float * query = (const float *) ((const char *) q->data + (ih*n_group + iq)*q->nb[1] + it*q->nb[2] + is*q->nb[3]);
+                float dot = 0.0f;
+                ggml_vec_dot_f32(n_dim, &dot, 0, query, 0, key, 0, 1);
+                score += dot;
+            }
+            score /= n_group;
+            for (int64_t isel = 0; isel < n_select; ++isel) {
+                if (score > best_score[isel]) {
+                    for (int64_t j = n_select - 1; j > isel; --j) {
+                        best_score[j] = best_score[j - 1];
+                        best_index[j] = best_index[j - 1];
+                    }
+                    best_score[isel] = score;
+                    best_index[isel] = ib;
+                    break;
+                }
+            }
+        }
+        for (int64_t isel = 0; isel < n_select; ++isel) {
+            out[isel] = best_index[isel];
+        }
+    }
+}
+
+void ggml_compute_forward_nsa_attention(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * q = dst->src[0];
+    const ggml_tensor * k = dst->src[1];
+    const ggml_tensor * v = dst->src[2];
+    const ggml_tensor * indices = dst->src[3];
+    GGML_ASSERT(q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F32 && v->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+
+    const int32_t block_size = ggml_get_op_params_i32(dst, 0);
+    const int32_t local_size = ggml_get_op_params_i32(dst, 1);
+    const int64_t n_dim = q->ne[0];
+    const int64_t n_q_head = q->ne[1];
+    const int64_t n_kv_head = k->ne[1];
+    const int64_t n_kv = k->ne[2];
+    const int64_t n_token = q->ne[2];
+    const int64_t n_stream = q->ne[3];
+    const int64_t n_select = indices->ne[0];
+    const int64_t n_group = n_q_head/n_kv_head;
+    const int64_t n_rows = n_q_head*n_token*n_stream;
+    const int64_t dr = (n_rows + params->nth - 1)/params->nth;
+    const float scale = 1.0f/sqrtf(n_dim);
+
+    for (int64_t ir = dr*params->ith; ir < MIN<int64_t>(dr*(params->ith + 1), n_rows); ++ir) {
+        const int64_t ihq = ir % n_q_head;
+        const int64_t it = (ir/n_q_head) % n_token;
+        const int64_t is = ir/(n_q_head*n_token);
+        const int64_t ihk = ihq/n_group;
+        const float * query = (const float *) ((const char *) q->data + ihq*q->nb[1] + it*q->nb[2] + is*q->nb[3]);
+        float * out = (float *) ((char *) dst->data + ihq*dst->nb[1] + it*dst->nb[2] + is*dst->nb[3]);
+        ggml_vec_set_f32(n_dim, out, 0.0f);
+        float score_max = -INFINITY;
+        float score_sum = 0.0f;
+        const int32_t * selected = (const int32_t *) ((const char *) indices->data + ihk*indices->nb[1] + it*indices->nb[2] + is*indices->nb[3]);
+        const int64_t local_begin = MAX<int64_t>(0, n_kv - local_size);
+        const int64_t n_candidates = n_select*block_size + n_kv - local_begin;
+        for (int64_t ic = 0; ic < n_candidates; ++ic) {
+            const int64_t ik = ic < n_select*block_size ? selected[ic/block_size]*block_size + ic%block_size : local_begin + ic - n_select*block_size;
+            if (ik < 0 || ik >= n_kv) continue;
+            const float * key = (const float *) ((const char *) k->data + ihk*k->nb[1] + ik*k->nb[2] + is*k->nb[3]);
+            const float * value = (const float *) ((const char *) v->data + ihk*v->nb[1] + ik*v->nb[2] + is*v->nb[3]);
+            float score = 0.0f;
+            ggml_vec_dot_f32(n_dim, &score, 0, query, 0, key, 0, 1);
+            score *= scale;
+            const float new_max = MAX(score_max, score);
+            const float prev = expf(score_max - new_max);
+            const float weight = expf(score - new_max);
+            ggml_vec_scale_f32(n_dim, out, prev);
+            ggml_vec_mad_f32(n_dim, out, value, weight);
+            score_sum = score_sum*prev + weight;
+            score_max = new_max;
+        }
+        if (score_sum > 0.0f) ggml_vec_scale_f32(n_dim, out, 1.0f/score_sum);
+    }
+}
