@@ -41,7 +41,6 @@ class HybridGatedDeltaNetModel(TextModel):
 
         self.gguf_writer.add_rope_dimension_count(attn["head_dim"])
         self.gguf_writer.add_rope_freq_base(attn["rope_theta"])
-        self.gguf_writer.add_sliding_window(attn["window_size"])
         self.gguf_writer.add_recurrent_layers([il % 2 == 0 for il in range(n_layer)])
         self.gguf_writer.add_ssm_conv_kernel(hp["conv_size"])
         self.gguf_writer.add_ssm_inner_size(hp["hidden_size"] * hp["expand_v"])
