@@ -27,7 +27,7 @@ cmake -S "$ROOT" -B "$BUILD" \
     -DLLAMA_BUILD_SERVER=OFF >/dev/null
 
 cmake --build "$BUILD" -j "${NSA_JOBS:-8}" \
-    --target test-gdn-op test-nsa-ops test-nsa-model llama-completion llama-bench >/dev/null
+    --target test-gdn-op test-nsa-ops test-nsa-model llama-completion llama-bench llama-tokenize >/dev/null
 
 echo "== GDN op =="
 "$BUILD/bin/test-gdn-op"
@@ -49,6 +49,10 @@ if [[ -n "${NSA_VULKAN_BUILD:-}" ]]; then
     NSA_TEST_GPU_LAYERS=99 NSA_TEST_KV_F32=1 NSA_TEST_MODEL="$MODEL" \
         "$NSA_VULKAN_BUILD/bin/test-nsa-model" /tmp/nsa_vk.bin
 fi
+
+echo "== tokenizer =="
+NSA_TOKENIZE="$BUILD/bin/llama-tokenize" NSA_GGUF="$MODEL" NSA_MODEL_DIR="$MODEL_DIR" \
+    uv run --project "$ROOT" python "$ROOT/tests/test-nsa-tokenizer.py"
 
 echo "== PyTorch reference =="
 uv run --project "$ROOT" python "$ROOT/tests/nsa_reference.py" \

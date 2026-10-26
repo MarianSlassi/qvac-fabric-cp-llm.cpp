@@ -1700,7 +1700,8 @@ int ggml_metal_op_nsa(ggml_metal_op_t ctx, int idx) {
                 ggml_metal_encoder_set_bytes(enc, &args, sizeof(args), 0);
 
                 const int n_rows = args.n_kv_head*args.n_block*args.n_stream;
-                ggml_metal_encoder_dispatch_threadgroups(enc, n_rows, 1, 1, 1, 1, 1);
+                const int n_threads = args.n_dim == 64 ? 32 : 1;
+                ggml_metal_encoder_dispatch_threadgroups(enc, n_rows, 1, 1, n_threads, 1, 1);
             } break;
         case GGML_OP_NSA_SELECT_BLOCKS:
             {

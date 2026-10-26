@@ -2,6 +2,7 @@
 
 #include "llama-batch.h"
 #include "llama-context.h"
+#include "llama-impl.h"
 #include "llama-io.h"
 #include "llama-model.h"
 
@@ -97,32 +98,42 @@ void llama_memory_hybrid_nsa::clear(bool data) {
 }
 
 bool llama_memory_hybrid_nsa::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
-    if (!llama_memory_hybrid::seq_rm(seq_id, p0, p1)) {
-        return false;
-    }
-    // the summary cache is append-only; a rollback invalidates it
-    mem_summary->clear(true);
-    return true;
+    (void) seq_id;
+    (void) p0;
+    (void) p1;
+    // summaries are indexed by absolute block number and cannot be shifted or
+    // partially removed; the caller has to clear the context instead
+    LLAMA_LOG_WARN("%s: partial sequence removal is not supported by the NSA summary cache\n", __func__);
+    return false;
 }
 
 void llama_memory_hybrid_nsa::seq_cp(llama_seq_id src, llama_seq_id dst, llama_pos p0, llama_pos p1) {
-    llama_memory_hybrid::seq_cp(src, dst, p0, p1);
-    mem_summary->clear(true);
+    (void) src;
+    (void) dst;
+    (void) p0;
+    (void) p1;
+    GGML_ABORT("%s: sequence copy is not supported by the NSA summary cache\n", __func__);
 }
 
 void llama_memory_hybrid_nsa::seq_keep(llama_seq_id seq_id) {
-    llama_memory_hybrid::seq_keep(seq_id);
-    mem_summary->clear(true);
+    (void) seq_id;
+    GGML_ABORT("%s: sequence keep is not supported by the NSA summary cache\n", __func__);
 }
 
 void llama_memory_hybrid_nsa::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
-    llama_memory_hybrid::seq_add(seq_id, p0, p1, shift);
-    mem_summary->clear(true);
+    (void) seq_id;
+    (void) p0;
+    (void) p1;
+    (void) shift;
+    GGML_ABORT("%s: context shifting is not supported by the NSA summary cache\n", __func__);
 }
 
 void llama_memory_hybrid_nsa::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
-    llama_memory_hybrid::seq_div(seq_id, p0, p1, d);
-    mem_summary->clear(true);
+    (void) seq_id;
+    (void) p0;
+    (void) p1;
+    (void) d;
+    GGML_ABORT("%s: context shifting is not supported by the NSA summary cache\n", __func__);
 }
 
 std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid_nsa::memory_breakdown() const {

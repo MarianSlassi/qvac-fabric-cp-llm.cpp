@@ -124,6 +124,91 @@ static result run(const case_data & c, ggml_backend_dev_t dev) {
     return r;
 }
 
+static bool summary_store_test(ggml_backend_dev_t dev) {
+    constexpr int n_kv   = 2*BS;
+    constexpr int n_blk  = 8;
+
+    std::mt19937 rng(99);
+    std::uniform_real_distribution<float> dis(-1.0f, 1.0f);
+
+    std::vector<float> k((size_t) D*HKV*n_kv);
+    std::vector<float> summary((size_t) D*HKV*n_blk, 1234.0f);
+    for (float & x : k) x = dis(rng);
+
+    struct ggml_init_params ip = { 64u*1024*1024, nullptr, true };
+    struct ggml_context * ctx = ggml_init(ip);
+    struct ggml_tensor * tk  = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, D, HKV, n_kv, 1);
+    struct ggml_tensor * ts  = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, D, HKV, n_blk, 1);
+    struct ggml_tensor * tr  = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 2);
+    struct ggml_tensor * out = ggml_nsa_summary_store(ctx, tk, ts, tr, BS);
+
+    struct ggml_cgraph * gf = ggml_new_graph(ctx);
+    ggml_build_forward_expand(gf, out);
+
+    struct ggml_backend * be = ggml_backend_dev_init(dev, nullptr);
+    struct ggml_backend_buffer * buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, ggml_backend_dev_buffer_type(dev));
+    (void) buf;
+
+    ggml_backend_tensor_set(tk, k.data(), 0, ggml_nbytes(tk));
+    ggml_backend_tensor_set(ts, summary.data(), 0, ggml_nbytes(ts));
+
+    auto compute = [&](int ib0, int ib1) {
+        int32_t range[2] = { ib0, ib1 };
+        ggml_backend_tensor_set(tr, range, 0, sizeof(range));
+        if (ggml_backend_graph_compute(be, gf) != GGML_STATUS_SUCCESS) {
+            return false;
+        }
+        ggml_backend_tensor_get(ts, summary.data(), 0, ggml_nbytes(ts));
+        return true;
+    };
+
+    bool ok = true;
+    ok = ok && compute(0, 1);
+
+    auto check_block = [&](int ib, bool from_k) {
+        double max_diff = 0.0;
+        for (int h = 0; h < HKV; ++h) {
+            for (int d = 0; d < D; ++d) {
+                float ref = 1234.0f;
+                if (from_k) {
+                    ref = 0.0f;
+                    for (int j = 0; j < BS; ++j) {
+                        ref += k[(size_t) d + D*((size_t) h + HKV*(ib*BS + j))];
+                    }
+                    ref /= BS;
+                }
+                const float got = summary[(size_t) d + D*((size_t) h + HKV*ib)];
+                max_diff = std::max(max_diff, (double) fabsf(got - ref));
+            }
+        }
+        return max_diff;
+    };
+
+    const double d0 = check_block(0, true);
+    const double d1 = check_block(1, false);
+    ok = ok && d0 < 1e-5 && d1 < 1e-5;
+
+    // range [0,0] must not modify the buffer
+    ok = ok && compute(0, 0);
+    const double d2 = check_block(0, true);
+    const double d3 = check_block(1, false);
+    ok = ok && d2 < 1e-5 && d3 < 1e-5;
+
+    // range [1,2] must write only block 1
+    ok = ok && compute(1, 2);
+    const double d4 = check_block(0, true);
+    const double d5 = check_block(1, true);
+    ok = ok && d4 < 1e-5 && d5 < 1e-5;
+
+    printf("%s: summary store max diff %.6g (noop %.6g, block1 %.6g)\n",
+           ggml_backend_dev_name(dev), std::max(std::max(d0, d1), std::max(d5, 0.0)), d3, d5);
+
+    ggml_backend_buffer_free(buf);
+    ggml_backend_free(be);
+    ggml_free(ctx);
+    return ok;
+}
+
 int main() {
     std::mt19937 rng(1234);
     const case_data c = make_case(rng);
@@ -223,10 +308,14 @@ int main() {
     const double d_cpu = compare(r_cpu, "cpu");
     if (d_cpu > 1e-5) fails++;
 
+    if (!summary_store_test(cpu)) fails++;
+
     if (gpu) {
         const result r_gpu = run(c, gpu);
         const double d_gpu = compare(r_gpu, ggml_backend_dev_name(gpu));
         if (d_gpu > 1e-4) fails++;
+
+        if (!summary_store_test(gpu)) fails++;
     } else {
         printf("no GPU backend, GPU check skipped\n");
     }

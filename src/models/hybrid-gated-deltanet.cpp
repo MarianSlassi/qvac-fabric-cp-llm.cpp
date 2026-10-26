@@ -117,6 +117,7 @@ ggml_tensor * llama_model_hybrid_gated_deltanet::graph::build_nsa(
     const int64_t nt = ubatch.n_seq_tokens;
     const int64_t ns = ubatch.n_seqs;
     GGML_ASSERT(ubatch.equal_seqs() && ubatch.n_tokens == nt*ns);
+    GGML_ASSERT(ubatch.n_seqs == 1 && "hybrid GDN+NSA supports one sequence");
     const int64_t n_head    = hparams.n_head(il);
     const int64_t n_head_kv = hparams.n_head_kv(il);
     const int64_t d         = hparams.n_embd_head_k(il);
