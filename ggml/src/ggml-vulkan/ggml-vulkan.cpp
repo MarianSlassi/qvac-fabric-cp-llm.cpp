@@ -1173,6 +1173,7 @@ struct vk_device_struct {
     vk_pipeline pipeline_nsa_block_summary_f32;
     vk_pipeline pipeline_nsa_summary_store_f32;
     vk_pipeline pipeline_nsa_select_blocks_f32;
+    vk_pipeline pipeline_nsa_select_blocks_tg_f32;
     vk_pipeline pipeline_nsa_attention_f32;
     vk_pipeline pipeline_gated_delta_net[4][2];
     // [size_idx][kda] where size_idx: 0=d32, 1=d64, 2=d128 (no d16 backward; falls back to CPU)
@@ -7146,6 +7147,7 @@ static void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
     ggml_vk_create_pipeline(device, device->pipeline_nsa_block_summary_f32, "nsa_block_summary_f32", nsa_block_summary_f32_len, nsa_block_summary_f32_data, "main", 2, sizeof(vk_op_nsa_block_summary_push_constants), {1, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_nsa_summary_store_f32, "nsa_summary_store_f32", nsa_summary_store_f32_len, nsa_summary_store_f32_data, "main", 3, sizeof(vk_op_nsa_summary_store_push_constants), {1, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_nsa_select_blocks_f32, "nsa_select_blocks_f32", nsa_select_blocks_f32_len, nsa_select_blocks_f32_data, "main", 4, sizeof(vk_op_nsa_select_blocks_push_constants), {1, 1, 1}, {}, 1);
+    ggml_vk_create_pipeline(device, device->pipeline_nsa_select_blocks_tg_f32, "nsa_select_blocks_tg_f32", nsa_select_blocks_tg_f32_len, nsa_select_blocks_tg_f32_data, "main", 4, sizeof(vk_op_nsa_select_blocks_push_constants), {1, 1, 1}, {}, 1);
     ggml_vk_create_pipeline(device, device->pipeline_nsa_attention_f32, "nsa_attention_f32", nsa_attention_f32_len, nsa_attention_f32_data, "main", 8, sizeof(vk_op_nsa_attention_push_constants), {1, 1, 1}, {}, 1);
 
     if (device->subgroup_arithmetic && device->subgroup_require_full_support) {
@@ -13798,8 +13800,13 @@ static vk_pipeline ggml_vk_op_get_pipeline(ggml_backend_vk_context * ctx, const 
         return ctx->device->pipeline_nsa_block_summary_f32;
     case GGML_OP_NSA_SUMMARY_STORE:
         return ctx->device->pipeline_nsa_summary_store_f32;
-    case GGML_OP_NSA_SELECT_BLOCKS:
+    case GGML_OP_NSA_SELECT_BLOCKS: {
+        const int64_t n_group = dst->src[0]->ne[1] / dst->src[1]->ne[1];
+        if (dst->src[0]->ne[0] == 64 && n_group > 0 && n_group <= 32 && dst->ne[0] <= 32 && dst->src[1]->ne[2] >= 32) {
+            return ctx->device->pipeline_nsa_select_blocks_tg_f32;
+        }
         return ctx->device->pipeline_nsa_select_blocks_f32;
+    }
     case GGML_OP_NSA_ATTENTION:
         return ctx->device->pipeline_nsa_attention_f32;
     case GGML_OP_GATED_DELTA_NET:

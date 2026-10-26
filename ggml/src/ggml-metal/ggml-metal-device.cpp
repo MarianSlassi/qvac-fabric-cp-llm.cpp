@@ -587,7 +587,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_nsa(
             break;
         case GGML_OP_NSA_SELECT_BLOCKS: {
             const int64_t n_group = op->src[0]->ne[1] / op->src[1]->ne[1];
-            if (op->src[0]->ne[0] == 64 && n_group > 0 && n_group <= 32 && op->ne[0] <= 32) {
+            if (op->src[0]->ne[0] == 64 && n_group > 0 && n_group <= 32 && op->ne[0] <= 32 && op->src[1]->ne[2] >= 32) {
                 name = "kernel_nsa_select_tg";
             } else {
                 name = "kernel_nsa_select";

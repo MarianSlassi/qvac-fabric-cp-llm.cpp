@@ -9351,20 +9351,21 @@ struct test_nsa_attention : public test_case {
     const int64_t n_seq;
     const int64_t bs;
     const int64_t topk;
+    const int64_t n_kv;
 
     std::string vars() override {
-        return VARS_TO_STR6(nh, nkv, n_token, n_seq, bs, topk);
+        return VARS_TO_STR7(nh, nkv, n_token, n_seq, bs, topk, n_kv);
     }
 
     double max_nmse_err() override {
         return 1e-5;
     }
 
-    test_nsa_attention(int64_t nh = 32, int64_t nkv = 2, int64_t n_token = 4, int64_t n_seq = 1, int64_t bs = 64, int64_t topk = 2)
-        : nh(nh), nkv(nkv), n_token(n_token), n_seq(n_seq), bs(bs), topk(topk) {}
+    test_nsa_attention(int64_t nh = 32, int64_t nkv = 2, int64_t n_token = 4, int64_t n_seq = 1, int64_t bs = 64, int64_t topk = 2, int64_t n_kv = 0)
+        : nh(nh), nkv(nkv), n_token(n_token), n_seq(n_seq), bs(bs), topk(topk),
+          n_kv(n_kv > 0 ? n_kv : ((n_token + bs - 1)/bs)*bs) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-        const int64_t n_kv = ((n_token + bs - 1)/bs)*bs;
 
         ggml_tensor * q  = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 64, nh, n_token, n_seq);
         ggml_tensor * k  = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 64, nkv, n_kv, n_seq);
@@ -12407,6 +12408,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_nsa_attention(32, 2, 4, 1, 64, 2));
     test_cases.emplace_back(new test_nsa_attention(32, 2, 64, 1, 64, 16));
     test_cases.emplace_back(new test_nsa_attention(32, 2, 4, 2, 64, 2));
+    test_cases.emplace_back(new test_nsa_attention(32, 2, 1, 1, 64, 4, 2048));
 
     for (ggml_type type : {GGML_TYPE_MXFP4, GGML_TYPE_NVFP4}) {
         test_cases.emplace_back(new test_repacked_mul_mat(type, 256, 1, 512));

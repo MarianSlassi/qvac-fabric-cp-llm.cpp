@@ -14,7 +14,9 @@ reference check.
   `ggml/src/ggml-cpu/ops.cpp` add four new ops:
   `NSA_BLOCK_SUMMARY`, `NSA_SUMMARY_STORE`, `NSA_SELECT_BLOCKS`, `NSA_ATTENTION`.
 - `ggml/src/ggml-metal/*` implements the same ops on Metal. The attention and
-  summary-store kernels use one threadgroup per row with 32 lanes.
+  summary-store kernels use one threadgroup per row with 32 lanes; selection
+  uses a 32-lane threadgroup for long contexts and the scalar path for short
+  contexts.
 - `ggml/src/ggml-vulkan/*` implements the same ops on Vulkan (f32 K/V).
 - `src/llama-memory-nsa-summary.*` and `src/llama-memory-hybrid-nsa.*` keep
   the per-block mean K/V summary buffer.
@@ -151,7 +153,7 @@ compares the three attention branches with a small C++ reference.
 token-by-token generation. `test-backend-ops -o NSA_ATTENTION` runs the
 selection + attention graph on CPU, Metal and Vulkan;
 `-o NSA_BLOCK_SUMMARY` covers the pooling op. On this machine both pass on
-Metal and Vulkan (3/3 and 2/2 cases).
+Metal and Vulkan (4/4 and 2/2 cases).
 
 ## Results
 
@@ -161,7 +163,7 @@ Vulkan uses f32 KV and `-fa off` because its NSA shaders are f32 only.
 | backend | pp128 | tg32 | RSS |
 |---|---:|---:|---:|
 | CPU | 441 t/s | 63.0 t/s | ~1.5 GB |
-| Metal | 2066 t/s | 58.1 t/s | ~1.5 GB |
+| Metal | 2062 t/s | 56.9 t/s | ~1.5 GB |
 | Vulkan | 188 t/s | 20.2 t/s | ~1.5 GB |
 
 The model is 358M params, 1.33 GiB in f32. Q8_0 is 365 MiB and also gives
@@ -169,9 +171,12 @@ coherent output on CPU and Metal. I did not benchmark Q8_0.
 
 Metal is much faster for prompt processing now that attention and summary
 store use 32-lane threadgroups. Token generation is roughly on par with CPU.
-Selection is still one thread per row and is the main Metal gap. Vulkan on
-macOS uses MoltenVK and the shaders are deliberately simple, so it is the
-slowest path.
+Selection uses a 32-lane threadgroup when there are at least 32 blocks; for
+short contexts the scalar path is faster. The same threshold is used on Vulkan.
+Vulkan on macOS uses MoltenVK and the shaders are deliberately simple, so it
+is the slowest path. Long-context examples (98-token prompt, 4096 context):
+Metal 1362 t/s prompt and 43.6 t/s decode; Vulkan 153 t/s prompt and 17.0 t/s
+decode.
 
 Metal assignment check:
 
@@ -239,7 +244,8 @@ Two bugs found during validation:
   -fa off`; otherwise the scheduler falls back to CPU for these ops.
 - Batched/multi-sequence prompt processing is not tested. The NSA graph
   assumes equal sequences and one stream.
-- Selection is still one thread per row on Metal and Vulkan.
+- Selection uses a threadgroup only when there are at least 32 blocks. Short
+  contexts use the scalar path; the threshold is a tuning point.
 - No CUDA and no mobile work.
 - The reference script is a PyTorch port, not the official fla kernels. The
   commands to run the official kernels on a CUDA machine are not included.
@@ -251,7 +257,7 @@ Two bugs found during validation:
 
 ## What I would do next
 
-1. Optimize selection on Metal/Vulkan (shared-memory top-k).
+1. Tune the selection threadgroup threshold and optimize the scalar short path.
 2. Add f16 Vulkan shaders so the default KV cache works without `-fa off`.
 3. Add a CUDA backend and run the official fla comparison there.
 4. Test multi-sequence, state save/load, rollback and longer contexts.

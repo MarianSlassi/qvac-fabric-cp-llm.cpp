@@ -1748,7 +1748,7 @@ int ggml_metal_op_nsa(ggml_metal_op_t ctx, int idx) {
 
                 const int n_rows = args.n_kv_head*args.n_token*args.n_stream;
                 const int n_group = args.n_q_head/args.n_kv_head;
-                const int n_threads = (args.n_dim == 64 && n_group > 0 && n_group <= 32 && args.n_select <= 32) ? 32 : 1;
+                const int n_threads = (args.n_dim == 64 && n_group > 0 && n_group <= 32 && args.n_select <= 32 && args.n_block >= 32) ? 32 : 1;
                 ggml_metal_encoder_dispatch_threadgroups(enc, n_rows, 1, 1, n_threads, 1, 1);
             } break;
         case GGML_OP_NSA_ATTENTION:
